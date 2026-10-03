@@ -178,14 +178,15 @@ typedef BOOL (*DecoderFn)(NSString *, NSString *, NSError **);
 static NSString *innerName(NSString *path) {
     NSString *name = path.lastPathComponent;
     NSString *low = name.lowercaseString;
-    // 双层优先：.7z.lz4 / .zip.lz4 / .tar.gz ...
+    // 双层优先：.7z.lz4 / .zip.lz4 / .tar.gz ...（value 带点，与 stem 直接拼接）
     NSDictionary<NSString *, NSString *> *two = @{
-        @".7z.lz4": @"7z", @".zip.lz4": @"zip", @".tar.lz4": @"tar",
-        @".tar.gz": @"tar", @".tar.bz2": @"tar", @".tar.xz": @"tar", @".tar.br": @"tar",
+        @".7z.lz4": @".7z", @".zip.lz4": @".zip", @".tar.lz4": @".tar",
+        @".tar.gz": @".tar", @".tar.bz2": @".tar", @".tar.xz": @".tar", @".tar.br": @".tar",
     };
     for (NSString *suf in two) {
         if ([low hasSuffix:suf]) {
-            return [name substringToIndex:name.length - suf.length];
+            NSString *stem = [name substringToIndex:name.length - suf.length];
+            return [stem stringByAppendingString:two[suf]];
         }
     }
     NSDictionary<NSString *, NSString *> *one = @{
