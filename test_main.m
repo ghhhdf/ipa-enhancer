@@ -68,7 +68,7 @@ static void test_lz4(void) {
         [src appendBytes:&v length:4];
     }
     NSData *srcData = [src copy];
-    size_t cap = LZ4F_compressFrameBufferBound(srcData.length, NULL);
+    size_t cap = LZ4F_compressFrameBound(srcData.length, NULL);
     NSMutableData *comp = [NSMutableData dataWithLength:cap];
     size_t clen = LZ4F_compressFrame(comp.mutableBytes, cap, srcData.bytes, srcData.length, NULL);
     if (LZ4F_isError(clen)) { T(@"lz4 compress", NO, @"frame error"); return; }
