@@ -57,26 +57,22 @@ static BOOL decode_lz4(NSString *src, NSString *dst, NSError **errOut) {
     for (;;) {
         size_t got = fread(inbuf, 1, sizeof(inbuf), in);
         if (got == 0) break;
-        const uint8_t *pin = inbuf;
-        size_t left = got;
-        for (;;) {
-            uint8_t *pout = outbuf;
-            size_t cap = sizeof(outbuf);
-            size_t ret = LZ4F_decompress(dctx, pout, &cap, pin, &left, NULL);
+        size_t pos = 0;
+        while (pos < got) {
+            size_t consumed = got - pos;
+            size_t produced = sizeof(outbuf);
+            size_t ret = LZ4F_decompress(dctx, outbuf, &produced, inbuf + pos, &consumed, NULL);
             if (LZ4F_isError(ret)) {
                 if (errOut) *errOut = [NSError errorWithDomain:@"ipaenhancer" code:-2
                     userInfo:@{NSLocalizedDescriptionKey:
                         [NSString stringWithFormat:@"lz4: %s", LZ4F_getErrorName(ret)]}];
-                ok = NO; break;
+                ok = NO; goto out;
             }
-            if (cap && fwrite(outbuf, 1, cap, out) != cap) { ok = NO; break; }
-            if (left == 0) break;
-            pin = inbuf + (got - left);
+            if (produced && fwrite(outbuf, 1, produced, out) != produced) { ok = NO; goto out; }
+            pos += consumed;
         }
-        if (!ok) break;
-        if (feof(in)) break;
     }
-    // 校验收尾：输入耗尽且返回 0 才算完整
+out:
     LZ4F_freeDecompressionContext(dctx);
     fclose(in);
     if (fclose(out) != 0) ok = NO;
