@@ -470,7 +470,7 @@ static void enh_alert(NSString *title, NSString *msg) {
 #endif
 }
 
-// ---------------- 导入链路诊断：hook 更多文件操作 + document picker 回调 ----------------
+// ---------------- 导入链路诊断：hook 更多文件操作 + document picker 回调（仅 iOS 真机） ----------------
 
 static BOOL (*orig_moveItemAtPath)(id self, SEL _cmd, NSString *src, NSString *dst, NSError **error);
 static BOOL new_moveItemAtPath(id self, SEL _cmd, NSString *src, NSString *dst, NSError **error) {
@@ -543,7 +543,8 @@ static void enhancer_init(void) {
         // iOS 26 兼容防护：App 启动/导入的文件拷贝抛异常 → 闪退/导入失败
         swizzle([NSFileManager class], @selector(copyItemAtPath:toPath:options:error:),
                 (IMP)new_copyItemAtPath, (IMP *)&orig_copyItemAtPath);
-        // 导入链路诊断：move/createFile/列目录 + document picker 回调
+#if TARGET_OS_IPHONE
+        // 导入链路诊断（仅 iOS 真机；macOS 宿主上与系统内部调用冲突，不装）
         swizzle([NSFileManager class], @selector(moveItemAtPath:toPath:error:),
                 (IMP)new_moveItemAtPath, (IMP *)&orig_moveItemAtPath);
         swizzle([NSFileManager class], @selector(createFileAtPath:contents:attributes:),
@@ -551,6 +552,7 @@ static void enhancer_init(void) {
         swizzle([NSFileManager class], @selector(contentsOfDirectoryAtPath:error:),
                 (IMP)new_contentsOfDirectory, (IMP *)&orig_contentsOfDirectory);
         hook_document_picker();
+#endif
         enh_log(@"enhancer v8 loaded (unarchive/handleUnzip/copy/move/createFile/listDir/documentPicker)");
     }
 }
