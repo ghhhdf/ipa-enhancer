@@ -354,6 +354,14 @@ static void enh_log(NSString *fmt, ...) {
 }
 
 static BOOL new_copyItemAtPath(id self, SEL _cmd, NSString *src, NSString *dst, NSUInteger options, NSError **error) {
+    // 防递归：Foundation 的 3 参 copyItemAtPath 内部会调 4 参版本，
+    // 我们的 orig 实现又可能回到 3 参 wrapper → 必须识别重入直接放行
+    static _Thread_local int in_copy = 0;
+    if (in_copy) {
+        return orig_copyItemAtPath(self, _cmd, src, dst, options, error);
+    }
+    in_copy = 1;
+
     BOOL startedScope = NO;
     NSURL *srcURL = nil;
     @try {
@@ -427,6 +435,7 @@ static BOOL new_copyItemAtPath(id self, SEL _cmd, NSString *src, NSString *dst, 
     }
 
 done:
+    in_copy = 0;
     if (startedScope) {
         @try { [srcURL stopAccessingSecurityScopedResource]; } @catch (NSException *e) {}
     }
