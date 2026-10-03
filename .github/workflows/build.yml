@@ -30,7 +30,9 @@ jobs:
           } > test.log 2>&1
           cat test.log
           if ! grep -q 'FAIL 0' test.log; then
-            echo '=== TESTS FAILED ==='
+            echo '=== TESTS FAILED, lldb backtrace ===' >> test.log
+            lldb -b -o 'run' -o 'thread backtrace all' -o 'quit' ./tester 2>&1 | tail -60 >> test.log || true
+            cat test.log | tail -70
             exit 42
           fi
 
