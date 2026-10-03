@@ -14,6 +14,7 @@
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <dlfcn.h>
 #import <TargetConditionals.h>
 #if TARGET_OS_IPHONE
@@ -321,9 +322,8 @@ static void swizzle(Class cls, SEL sel, IMP newImp, IMP *origOut) {
 // 实测（原版对照同现）：App 6.3.7 在 iOS 26.5 上启动资源拷贝抛异常致闪退、导入文件静默失败。
 // 对策：①目标已存在 → 幂等返回 YES（App 语义是"确保文件就位"）
 //      ②源文件自动取得安全作用域权限（iOS 文件选择器选中的文件需 startAccessing 才可读）
-//      ③系统拷贝失败 → 备用 NSData 直写绕过限制
-//      ④异常一律捕获转普通失败返回，绝不让异常逃逸
-//      ⑤关键调用写诊断日志到 Documents/ipaenhancer.log，失败时 App 内弹窗显示原因
+//      ③异常一律捕获转普通失败返回，绝不让异常逃逸
+//      ④关键调用写诊断日志到 Documents/ipaenhancer.log（可通过文件共享导出）
 static BOOL (*orig_copyItemAtPath)(id self, SEL _cmd, NSString *src, NSString *dst, NSUInteger options, NSError **error);
 
 static void enh_log(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
@@ -350,38 +350,6 @@ static void enh_log(NSString *fmt, ...) {
     } else {
         [d writeToFile:logPath atomically:YES];
     }
-}
-
-// 诊断弹窗：拷贝失败时在 App 内直接显示原因（无需数据线即可反馈）
-static void enh_alert(NSString *title, NSString *msg) {
-#if TARGET_OS_IPHONE
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @try {
-            Class alertCls = NSClassFromString(@"UIAlertController");
-            Class sceneCls = NSClassFromString(@"UIWindowScene");
-            if (!alertCls || !sceneCls) return;
-            id alert = [alertCls alertControllerWithTitle:title message:msg
-                preferredStyle:UIAlertControllerStyleAlert];
-            id app = [[UIApplication class] performSelector:@selector(sharedApplication)];
-            id scenes = [app performSelector:@selector(connectedScenes)];
-            id active = nil;
-            for (id scene in scenes) {
-                if ([[scene valueForKey:@"activationState"] intValue] == 0) continue; // unattached
-                if ([[scene valueForKey:@"activationState"] intValue] == 2) { active = scene; break; } // foregroundActive
-            }
-            if (!active) return;
-            id win = [active valueForKey:@"keyWindow"];
-            id vc = [win valueForKey:@"rootViewController"];
-            if (!vc) return;
-            while ([vc respondsToSelector:@selector(presentedViewController)] &&
-                   [vc performSelector:@selector(presentedViewController)]) {
-                vc = [vc performSelector:@selector(presentedViewController)];
-            }
-            [vc performSelector:@selector(presentViewController:animated:completion:)
-                     withObject:alert withObject:nil withObject:nil];
-        } @catch (NSException *e) {}
-    });
-#endif
 }
 
 static BOOL new_copyItemAtPath(id self, SEL _cmd, NSString *src, NSString *dst, NSUInteger options, NSError **error) {
@@ -435,6 +403,7 @@ static BOOL new_copyItemAtPath(id self, SEL _cmd, NSString *src, NSString *dst, 
             if ([fm fileExistsAtPath:src isDirectory:&isDir] && !isDir) {
                 NSData *bytes = [NSData dataWithContentsOfFile:src];
                 if (bytes) {
+                    // 确保父目录存在
                     NSString *parent = [dst stringByDeletingLastPathComponent];
                     if (parent.length) [fm createDirectoryAtPath:parent withIntermediateDirectories:YES attributes:nil error:nil];
                     if ([bytes writeToFile:dst atomically:YES]) {
@@ -465,6 +434,39 @@ done:
                   src.lastPathComponent ?: @"-", dst.lastPathComponent ?: @"-", failMsg]);
     }
     return result;
+}
+
+// 诊断弹窗：拷贝失败时在 App 内直接显示原因（无需数据线即可反馈）
+static void enh_alert(NSString *title, NSString *msg) {
+#if TARGET_OS_IPHONE
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            Class alertCls = NSClassFromString(@"UIAlertController");
+            Class sceneCls = NSClassFromString(@"UIWindowScene");
+            if (!alertCls || !sceneCls) return;
+            id alert = [alertCls alertControllerWithTitle:title message:msg
+                preferredStyle:UIAlertControllerStyleAlert];
+            id app = [[UIApplication class] performSelector:@selector(sharedApplication)];
+            id scenes = [app performSelector:@selector(connectedScenes)];
+            id active = nil;
+            for (id scene in scenes) {
+                if ([[scene valueForKey:@"activationState"] intValue] == 0) continue; // unattached
+                if ([[scene valueForKey:@"activationState"] intValue] == 2) { active = scene; break; } // foregroundActive
+            }
+            if (!active) return;
+            id win = [active valueForKey:@"keyWindow"];
+            id vc = [win valueForKey:@"rootViewController"];
+            if (!vc) return;
+            while ([vc respondsToSelector:@selector(presentedViewController)] &&
+                   [vc performSelector:@selector(presentedViewController)]) {
+                vc = [vc performSelector:@selector(presentedViewController)];
+            }
+            void (*presentVC)(id, SEL, id, BOOL, void (^)(void)) =
+                (void (*)(id, SEL, id, BOOL, void (^)(void)))objc_msgSend;
+            presentVC(vc, @selector(presentViewController:animated:completion:), alert, YES, NULL);
+        } @catch (NSException *e) {}
+    });
+#endif
 }
 
 __attribute__((constructor))
