@@ -3,6 +3,7 @@
 // 在 macOS Foundation（与 iOS 同源实现）上验证：路由表 / 五格式解码 / 接力 / copyItemAtPath 防护
 #import <Foundation/Foundation.h>
 #import "enhancer.m"
+#import "brotli/encode.h"
 
 static int g_pass = 0, g_fail = 0;
 
@@ -70,7 +71,7 @@ static void test_lz4(void) {
     size_t cap = LZ4F_compressFrameBufferBound(srcData.length, NULL);
     NSMutableData *comp = [NSMutableData dataWithLength:cap];
     size_t clen = LZ4F_compressFrame(comp.mutableBytes, cap, srcData.bytes, srcData.length, NULL);
-    if (LZ4F_isError(clen)) { T("lz4 compress", NO, @"frame error"); return; }
+    if (LZ4F_isError(clen)) { T(@"lz4 compress", NO, @"frame error"); return; }
     comp.length = clen;
 
     NSString *srcP = [NSTemporaryDirectory() stringByAppendingPathComponent:@"t.lz4"];
@@ -78,8 +79,8 @@ static void test_lz4(void) {
     writeFile(srcP, comp);
     NSError *err = nil;
     BOOL ok = decode_lz4(srcP, dstP, &err);
-    T("lz4 decode", ok, err.localizedDescription ?: @"-");
-    T("lz4 round-trip 内容一致", ok && eqDataOk(readFile(dstP), srcData), ok ? @"-" : @"内容不一致");
+    T(@"lz4 decode", ok, err.localizedDescription ?: @"-");
+    T(@"lz4 round-trip 内容一致", ok && eqDataOk(readFile(dstP), srcData), ok ? @"-" : @"内容不一致");
 
     // 双层语义：payload.7z.lz4 → innerName=payload.7z → decode → 内容应为 7z 原始字节
     NSString *fake = [NSTemporaryDirectory() stringByAppendingPathComponent:@"payload.7z.lz4"];
@@ -88,7 +89,7 @@ static void test_lz4(void) {
     DecoderFn fn = decoderFor(fake, &inner);
     NSString *innerDst = [NSTemporaryDirectory() stringByAppendingPathComponent:(inner ?: @"x")];
     ok = (fn != NULL) && [inner isEqualToString:@"payload.7z"] && decode_lz4(fake, innerDst, &err);
-    T(".7z.lz4 双层接力命名+解码", ok,
+    T(@".7z.lz4 双层接力命名+解码", ok,
       [NSString stringWithFormat:@"inner=%@ err=%@", inner ?: @"nil", err.localizedDescription ?: @"-"]);
 }
 
@@ -114,7 +115,7 @@ static void test_gz_bz2_br(void) {
     NSString *gp = [NSTemporaryDirectory() stringByAppendingPathComponent:@"rt.gz"];
     writeFile(gp, gz);
     BOOL ok = decode_gzip(gp, dstP, &err);
-    T("gz decode+round-trip", ok && eqDataOk(readFile(dstP), srcData), err.localizedDescription ?: @"-");
+    T(@"gz decode+round-trip", ok && eqDataOk(readFile(dstP), srcData), err.localizedDescription ?: @"-");
 
     // bz2
     unsigned int cb = (unsigned int)(srcData.length + srcData.length / 100 + 600);
@@ -126,7 +127,7 @@ static void test_gz_bz2_br(void) {
     NSString *bp = [NSTemporaryDirectory() stringByAppendingPathComponent:@"rt.bz2"];
     writeFile(bp, bz);
     ok = decode_bzip2(bp, dstP, &err);
-    T("bz2 decode+round-trip", ok && eqDataOk(readFile(dstP), srcData), err.localizedDescription ?: @"-");
+    T(@"bz2 decode+round-trip", ok && eqDataOk(readFile(dstP), srcData), err.localizedDescription ?: @"-");
 
     // brotli（编码器来自 brotli/c/enc）
     size_t eb = BrotliEncoderMaxCompressedSize(srcData.length);
@@ -139,7 +140,7 @@ static void test_gz_bz2_br(void) {
     NSString *brp = [NSTemporaryDirectory() stringByAppendingPathComponent:@"rt.br"];
     writeFile(brp, br);
     ok = decode_brotli(brp, dstP, &err);
-    T("brotli decode+round-trip", ok && eqDataOk(readFile(dstP), srcData), err.localizedDescription ?: @"-");
+    T(@"brotli decode+round-trip", ok && eqDataOk(readFile(dstP), srcData), err.localizedDescription ?: @"-");
 }
 
 // ---------- 4. copyItemAtPath 防护（constructor 已 swizzle） ----------
@@ -155,16 +156,16 @@ static void test_copy_protection(void) {
 
     NSError *err = nil;
     BOOL ok = [fm copyItemAtPath:src toPath:dst error:&err];
-    T("copy 正常路径", ok, err.localizedDescription ?: @"-");
+    T(@"copy 正常路径", ok, err.localizedDescription ?: @"-");
 
     err = nil;
     ok = [fm copyItemAtPath:src toPath:dst error:&err];
-    T("copy 目标已存在 → 幂等 YES", ok, err.localizedDescription ?: @"-");
+    T(@"copy 目标已存在 → 幂等 YES", ok, err.localizedDescription ?: @"-");
 
     err = nil;
     ok = [fm copyItemAtPath:[dir stringByAppendingPathComponent:@"no-such-file.bin"]
                      toPath:dst error:&err];
-    T("copy 源不存在 → NO 不崩", ok == NO, @"-");
+    T(@"copy 源不存在 → NO 不崩", ok == NO, @"-");
 }
 
 // ---------- 5. 双层接力端到端（tar.gz → tar） ----------
@@ -197,7 +198,7 @@ static void test_relay_targz(void) {
     NSString *innerDst = [dir stringByAppendingPathComponent:(inner ?: @"x.tar")];
     NSError *err = nil;
     BOOL ok = (fn != NULL) && [inner isEqualToString:@"arch.tar"] && decode_gzip(tgzP, innerDst, &err);
-    T("tar.gz innerName+解码+内容一致", ok && eqDataOk(readFile(innerDst), tarData),
+    T(@"tar.gz innerName+解码+内容一致", ok && eqDataOk(readFile(innerDst), tarData),
       [NSString stringWithFormat:@"inner=%@ err=%@", inner ?: @"nil", err.localizedDescription ?: @"-"]);
 }
 
