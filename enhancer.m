@@ -315,28 +315,78 @@ static void swizzle(Class cls, SEL sel, IMP newImp, IMP *origOut) {
 // ---------------- iOS 26 兼容性防护：NSFileManager.copyItemAtPath ----------------
 // 实测（原版对照同现）：App 6.3.7 在 iOS 26.5 上启动资源拷贝抛异常致闪退、导入文件静默失败。
 // 对策：①目标已存在 → 幂等返回 YES（App 语义是"确保文件就位"）
-//      ②异常一律捕获转普通失败返回，绝不让异常逃逸
+//      ②源文件自动取得安全作用域权限（iOS 文件选择器选中的文件需 startAccessing 才可读）
+//      ③异常一律捕获转普通失败返回，绝不让异常逃逸
+//      ④关键调用写诊断日志到 Documents/ipaenhancer.log（可通过文件共享导出）
 static BOOL (*orig_copyItemAtPath)(id self, SEL _cmd, NSString *src, NSString *dst, NSUInteger options, NSError **error);
+
+static void enh_log(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
+static void enh_log(NSString *fmt, ...) {
+    static NSString *logPath = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        if (docs) logPath = [docs stringByAppendingPathComponent:@"ipaenhancer.log"];
+    });
+    if (!logPath) return;
+    va_list args;
+    va_start(args, fmt);
+    NSString *line = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    NSString *out = [NSString stringWithFormat:@"[%lld] %@\n",
+                     (long long)[[NSDate date] timeIntervalSince1970], line];
+    NSData *d = [out dataUsingEncoding:NSUTF8StringEncoding];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSFileHandle *fh = [fm fileHandleForWritingAtPath:logPath];
+    if (fh) {
+        [fh seekToEndOfFile];
+        [fh writeData:d];
+        [fh closeFile];
+    } else {
+        [d writeToFile:logPath atomically:YES];
+    }
+}
+
 static BOOL new_copyItemAtPath(id self, SEL _cmd, NSString *src, NSString *dst, NSUInteger options, NSError **error) {
+    BOOL startedScope = NO;
+    @try {
+        if ([src respondsToSelector:@selector(startAccessingSecurityScopedResource)]) {
+            startedScope = [src startAccessingSecurityScopedResource];
+        }
+    } @catch (NSException *e) { startedScope = NO; }
+
+    BOOL result = NO;
+    NSError *localErr = nil;
     @try {
         if (src && dst) {
             if ([(NSFileManager *)self fileExistsAtPath:dst]) {
                 if (error) *error = nil;
-                return YES; // 目标已就位，幂等成功
+                enh_log(@"copy: dst exists, idempotent YES  src=%@ dst=%@", src.lastPathComponent, dst.lastPathComponent);
+                result = YES;
+                goto done;
             }
         }
-    } @catch (NSException *e) {}
-    @try {
-        return orig_copyItemAtPath(self, _cmd, src, dst, options, error);
+        result = orig_copyItemAtPath(self, _cmd, src, dst, options, &localErr);
+        enh_log(@"copy: orig=%@ err=%@ src=%@ dst=%@ scope=%d",
+                result ? @"YES" : @"NO",
+                localErr.localizedDescription ?: @"-", src, dst, startedScope);
+        if (!result && error && localErr) *error = localErr;
     } @catch (NSException *e) {
+        enh_log(@"copy: EXCEPTION %@ (%@) src=%@ dst=%@ scope=%d", e.name, e.reason ?: @"-", src, dst, startedScope);
         if ([e.name isEqualToString:@"NSFileAlreadyExistsException"]) {
             if (error) *error = nil;
-            return YES;
+            result = YES;
+        } else {
+            if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:-1
+                userInfo:@{NSLocalizedDescriptionKey: e.reason ?: @"copy failed"}];
+            result = NO;
         }
-        if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:-1
-            userInfo:@{NSLocalizedDescriptionKey: e.reason ?: @"copy failed"}];
-        return NO;
     }
+done:
+    if (startedScope) {
+        @try { [src stopAccessingSecurityScopedResource]; } @catch (NSException *e) {}
+    }
+    return result;
 }
 
 __attribute__((constructor))
@@ -352,5 +402,6 @@ static void enhancer_init(void) {
         // iOS 26 兼容防护：App 启动/导入的文件拷贝抛异常 → 闪退/导入失败
         swizzle([NSFileManager class], @selector(copyItemAtPath:toPath:options:error:),
                 (IMP)new_copyItemAtPath, (IMP *)&orig_copyItemAtPath);
+        enh_log(@"enhancer v5 loaded (swizzle: unarchiveFile/handleUnzip/copyItemAtPath)");
     }
 }
