@@ -322,11 +322,13 @@ static void swizzle(Class cls, SEL sel, IMP newImp, IMP *origOut) {
 // 实测（原版对照同现）：App 6.3.7 在 iOS 26.5 上启动资源拷贝抛异常致闪退、导入文件静默失败。
 // 对策：①目标已存在 → 幂等返回 YES（App 语义是"确保文件就位"）
 //      ②源文件自动取得安全作用域权限（iOS 文件选择器选中的文件需 startAccessing 才可读）
-//      ③异常一律捕获转普通失败返回，绝不让异常逃逸
-//      ④关键调用写诊断日志到 Documents/ipaenhancer.log（可通过文件共享导出）
+//      ③系统拷贝失败 → 备用 NSData 直写绕过限制
+//      ④异常一律捕获转普通失败返回，绝不让异常逃逸
+//      ⑤关键调用写诊断日志到 Documents/ipaenhancer.log，失败时 App 内弹窗显示原因
 static BOOL (*orig_copyItemAtPath)(id self, SEL _cmd, NSString *src, NSString *dst, NSUInteger options, NSError **error);
 
 static void enh_log(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
+static void enh_alert(NSString *title, NSString *msg);
 static void enh_log(NSString *fmt, ...) {
     static NSString *logPath = nil;
     static dispatch_once_t once;
