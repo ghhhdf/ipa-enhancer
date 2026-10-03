@@ -22,8 +22,6 @@
 #import "zlib.h"
 #import "bzlib.h"
 
-// ---------------- 通用流式解码骨架 ----------------
-
 #define BUF_SIZE (1 << 20) // 1MB，与安卓版缓冲一致
 
 // ---------------- LZ4 frame ----------------
@@ -53,7 +51,7 @@ static BOOL decode_lz4(NSString *src, NSString *dst, NSError **errOut) {
             if (LZ4F_isError(ret)) {
                 if (errOut) *errOut = [NSError errorWithDomain:@"ipaenhancer" code:-2
                     userInfo:@{NSLocalizedDescriptionKey:
-                        [NSString stringWithFormat:@"lz4: %s", LZ4F_getErrorName(ret)]]}];
+                        [NSString stringWithFormat:@"lz4: %s", LZ4F_getErrorName(ret)]}];
                 ok = NO; break;
             }
             if (cap && fwrite(outbuf, 1, cap, out) != cap) { ok = NO; break; }
@@ -206,6 +204,7 @@ static NSString *innerName(NSString *path) {
 static DecoderFn decoderFor(NSString *path, NSString **innerOut) {
     NSString *name = path.lastPathComponent;
     NSString *low = name.lowercaseString;
+    // 返回同时负责给内层命名
     *innerOut = innerName(path);
     if (!*innerOut) return NULL;
     if ([low hasSuffix:@".lz4"] || [low hasSuffix:@".tar.lz4"]) return decode_lz4;
