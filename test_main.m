@@ -3,7 +3,6 @@
 // 在 macOS Foundation（与 iOS 同源实现）上验证：路由表 / 五格式解码 / 接力 / copyItemAtPath 防护
 #import <Foundation/Foundation.h>
 #import "enhancer.m"
-#import "brotli/encode.h"
 
 static int g_pass = 0, g_fail = 0;
 
@@ -129,21 +128,21 @@ static void test_gz_bz2_br(void) {
     ok = decode_bzip2(bp, dstP, &err);
     T(@"bz2 decode+round-trip", ok && eqDataOk(readFile(dstP), srcData), err.localizedDescription ?: @"-");
 
-    // brotli（编码器来自 brotli/c/enc）
-    size_t eb = BrotliEncoderMaxCompressedSize(srcData.length);
-    NSMutableData *br = [NSMutableData dataWithLength:eb ?: 1024];
-    size_t brLen = br.length;
-    BrotliEncoderCompress(BROTLI_DEFAULT_QUALITY, BROTLI_DEFAULT_WINDOW, BROTLI_MODE_GENERIC,
-                          srcData.length, (const uint8_t *)srcData.bytes, &brLen,
-                          (uint8_t *)br.mutableBytes);
-    br.length = brLen;
+    // brotli：内嵌固定样本（python brotli.compress 预生成 35B → 100KB，排除压缩端干扰）
+    static const uint8_t brComp[] = {
+        0x5b, 0x9f, 0x86, 0x01, 0x42, 0x11, 0x2a, 0xbd, 0x41, 0x62, 0x64, 0x66,
+        0xb4, 0x20, 0x83, 0x20, 0xf3, 0x99, 0x18, 0x35, 0xc5, 0x22, 0x4a, 0x31,
+        0x69, 0x42, 0xb9, 0xac, 0xc3, 0xd2, 0x3d, 0x7e, 0x01, 0xb6, 0x07,
+    };
+    NSData *brData = [NSData dataWithBytes:brComp length:sizeof(brComp)];
     NSString *brp = [NSTemporaryDirectory() stringByAppendingPathComponent:@"rt.br"];
-    writeFile(brp, br);
+    writeFile(brp, brData);
     ok = decode_brotli(brp, dstP, &err);
     NSData *brOut = readFile(dstP);
-    T(@"brotli decode+round-trip", ok && eqDataOk(brOut, srcData),
+    T(@"brotli decode（固定样本）", ok && eqDataOk(brOut, srcData),
       [NSString stringWithFormat:@"ok=%d err=%@ out=%lu want=%lu",
-       ok, err.localizedDescription ?: @"-", (unsigned long)brOut.length, (unsigned long)srcData.length]);
+       ok, err.localizedDescription ?: @"-",
+       (unsigned long)brOut.length, (unsigned long)srcData.length]);
 }
 
 // ---------- 4. copyItemAtPath 防护（constructor 已 swizzle） ----------
