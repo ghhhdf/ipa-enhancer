@@ -140,7 +140,10 @@ static void test_gz_bz2_br(void) {
     NSString *brp = [NSTemporaryDirectory() stringByAppendingPathComponent:@"rt.br"];
     writeFile(brp, br);
     ok = decode_brotli(brp, dstP, &err);
-    T(@"brotli decode+round-trip", ok && eqDataOk(readFile(dstP), srcData), err.localizedDescription ?: @"-");
+    NSData *brOut = readFile(dstP);
+    T(@"brotli decode+round-trip", ok && eqDataOk(brOut, srcData),
+      [NSString stringWithFormat:@"ok=%d err=%@ out=%lu want=%lu",
+       ok, err.localizedDescription ?: @"-", (unsigned long)brOut.length, (unsigned long)srcData.length]);
 }
 
 // ---------- 4. copyItemAtPath 防护（constructor 已 swizzle） ----------
@@ -163,9 +166,10 @@ static void test_copy_protection(void) {
     T(@"copy 目标已存在 → 幂等 YES", ok, err.localizedDescription ?: @"-");
 
     err = nil;
+    NSString *dst2 = [dir stringByAppendingPathComponent:@"dst2.bin"]; // 独立目标，避免幂等分支干扰
     ok = [fm copyItemAtPath:[dir stringByAppendingPathComponent:@"no-such-file.bin"]
-                     toPath:dst error:&err];
-    T(@"copy 源不存在 → NO 不崩", ok == NO, @"-");
+                      toPath:dst2 error:&err];
+    T(@"copy 源不存在 → NO 不崩", ok == NO, err.localizedDescription ?: @"-");
 }
 
 // ---------- 5. 双层接力端到端（tar.gz → tar） ----------
