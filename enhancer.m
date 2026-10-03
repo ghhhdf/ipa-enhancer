@@ -103,10 +103,12 @@ static BOOL decode_brotli(NSString *src, NSString *dst, NSError **errOut) {
         size_t cap = sizeof(outbuf);
         BrotliDecoderResult r = BrotliDecoderDecompressStream(
             s, &avail_in, &next_in, &cap, &pout, NULL);
+        // 注意：cap 返回的是"剩余可用容量"，实际写入 = 容量 - 剩余
+        size_t produced = sizeof(outbuf) - cap;
 #ifdef ENH_DEBUG
-        fprintf(stderr, "BR: r=%d cap=%zu avail_in=%zu eof=%d\n", (int)r, cap, avail_in, (int)eof);
+        fprintf(stderr, "BR: r=%d produced=%zu avail_in=%zu eof=%d\n", (int)r, produced, avail_in, (int)eof);
 #endif
-        if (cap && fwrite(outbuf, 1, cap, out) != cap) { ok = NO; break; }
+        if (produced && fwrite(outbuf, 1, produced, out) != produced) { ok = NO; break; }
         if (r == BROTLI_DECODER_RESULT_SUCCESS) break;
         if (r == BROTLI_DECODER_RESULT_ERROR) {
             if (errOut) *errOut = [NSError errorWithDomain:@"ipaenhancer" code:-3
