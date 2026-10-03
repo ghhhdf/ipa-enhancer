@@ -17,30 +17,46 @@ jobs:
 
       - name: Build dylib (arm64, iPhoneOS SDK)
         run: |
-          set -e
-          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
-          echo "SDK: $SDK"
-          BROTLI_SRC=$(ls brotli/c/common/*.c brotli/c/dec/*.c)
-          xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=11.0 \
-            -dynamiclib -O2 \
-            -Ilz4/lib -Ibrotli/c/include \
-            enhancer.m \
-            lz4/lib/lz4.c lz4/lib/lz4frame.c lz4/lib/lz4hc.c lz4/lib/xxhash.c \
-            $BROTLI_SRC \
-            -framework Foundation \
-            -lz -lbz2 \
-            -install_name @executable_path/libipaenhancer.dylib \
-            -Wl,-headerpad_max_install_names \
-            -o libipaenhancer.dylib
-          file libipaenhancer.dylib
-          ls -la libipaenhancer.dylib
+          {
+            set -x
+            SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+            echo "SDK: $SDK"
+            BROTLI_SRC=$(ls brotli/c/common/*.c brotli/c/dec/*.c)
+            xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=11.0 \
+              -dynamiclib -O2 \
+              -Ilz4/lib -Ibrotli/c/include \
+              enhancer.m \
+              lz4/lib/lz4.c lz4/lib/lz4frame.c lz4/lib/lz4hc.c lz4/lib/xxhash.c \
+              $BROTLI_SRC \
+              -framework Foundation \
+              -lz -lbz2 \
+              -install_name @executable_path/libipaenhancer.dylib \
+              -Wl,-headerpad_max_install_names \
+              -o libipaenhancer.dylib
+            file libipaenhancer.dylib
+          } > build.log 2>&1 || true
+          if [ ! -f libipaenhancer.dylib ]; then
+            echo "BUILD FAILED, see build.log in release"
+            exit 42
+          fi
+          tail -5 build.log
+
+      - name: Upload log to release (failure)
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: log-${{ github.run_number }}
+          name: build log ${{ github.run_number }}
+          files: build.log
 
       - uses: actions/upload-artifact@v4
+        if: success()
         with:
           name: libipaenhancer
           path: libipaenhancer.dylib
 
       - name: Publish to release
+        if: success()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
