@@ -361,7 +361,6 @@ static BOOL new_copyItemAtPath(id self, SEL _cmd, NSString *src, NSString *dst, 
         return orig_copyItemAtPath(self, _cmd, src, dst, options, error);
     }
     in_copy = 1;
-
     BOOL startedScope = NO;
     NSURL *srcURL = nil;
     @try {
@@ -481,6 +480,81 @@ static void enh_alert(NSString *title, NSString *msg) {
 
 // ---------------- 导入链路诊断：hook 更多文件操作 + document picker 回调（仅 iOS 真机） ----------------
 
+// 3 参 copyItemAtPath:toPath:error: —— App 启动/导入实际调用的入口（Foundation 内部
+// 直接 IMP 调用 4 参实现，绕过 4 参 swizzle，所以必须直接 hook 3 参）
+static BOOL (*orig_copy3)(id self, SEL _cmd, NSString *src, NSString *dst, NSError **error);
+
+// 备用拷贝：NSData 读源直接写目标（绕过系统 copy 的限制/异常）
+static BOOL enh_fallback_copy(NSString *src, NSString *dst) {
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:src isDirectory:&isDir] || isDir) return NO;
+        NSData *bytes = [NSData dataWithContentsOfFile:src];
+        if (!bytes) return NO;
+        NSString *parent = [dst stringByDeletingLastPathComponent];
+        if (parent.length) [fm createDirectoryAtPath:parent withIntermediateDirectories:YES attributes:nil error:nil];
+        return [bytes writeToFile:dst atomically:YES];
+    } @catch (NSException *e) {
+        return NO;
+    }
+}
+
+static BOOL new_copy3(id self, SEL _cmd, NSString *src, NSString *dst, NSError **error) {
+    static _Thread_local int in3 = 0;
+    if (in3) {
+        return orig_copy3(self, _cmd, src, dst, error);
+    }
+    in3 = 1;
+
+    // 目标已存在 → 幂等成功
+    @try {
+        if (src && dst && [(NSFileManager *)self fileExistsAtPath:dst]) {
+            if (error) *error = nil;
+            enh_log(@"copy3: dst exists, idempotent YES dst=%@", dst.lastPathComponent);
+            in3 = 0;
+            return YES;
+        }
+    } @catch (NSException *e) {}
+
+    BOOL r = NO;
+    NSError *le = nil;
+    @try {
+        r = orig_copy3(self, _cmd, src, dst, &le);
+        enh_log(@"copy3: orig=%@ err=%@ src=%@ dst=%@", r ? @"YES" : @"NO",
+                le.localizedDescription ?: @"-", src, dst);
+        if (error && le) *error = le;
+    } @catch (NSException *e) {
+        enh_log(@"copy3: EXCEPTION %@ (%@) src=%@ dst=%@", e.name, e.reason ?: @"-", src, dst);
+        if ([e.name isEqualToString:@"NSFileAlreadyExistsException"]) {
+            if (error) *error = nil;
+            in3 = 0;
+            return YES;
+        }
+        le = [NSError errorWithDomain:NSCocoaErrorDomain code:-1
+            userInfo:@{NSLocalizedDescriptionKey: e.reason ?: @"copy exception"}];
+        if (error) *error = le;
+        r = NO;
+    }
+
+    // 系统拷贝失败 → 备用 NSData 直写
+    if (!r) {
+        if (enh_fallback_copy(src, dst)) {
+            enh_log(@"copy3: FALLBACK 成功 dst=%@", dst.lastPathComponent);
+            if (error) *error = nil;
+            in3 = 0;
+            return YES;
+        }
+        enh_log(@"copy3: FALLBACK 也失败 dst=%@", dst.lastPathComponent);
+        enh_alert(@"解压专家·导入诊断",
+                  [NSString stringWithFormat:@"文件拷贝失败\n\n来源: %@\n目标: %@\n系统错误: %@",
+                   src.lastPathComponent ?: @"-", dst.lastPathComponent ?: @"-",
+                   le.localizedDescription ?: @"-"]);
+    }
+    in3 = 0;
+    return r;
+}
+
 static BOOL (*orig_moveItemAtPath)(id self, SEL _cmd, NSString *src, NSString *dst, NSError **error);
 static BOOL new_moveItemAtPath(id self, SEL _cmd, NSString *src, NSString *dst, NSError **error) {
     BOOL r = orig_moveItemAtPath(self, _cmd, src, dst, error);
@@ -553,7 +627,10 @@ static void enhancer_init(void) {
         swizzle([NSFileManager class], @selector(copyItemAtPath:toPath:options:error:),
                 (IMP)new_copyItemAtPath, (IMP *)&orig_copyItemAtPath);
 #if TARGET_OS_IPHONE
-        // 导入链路诊断（仅 iOS 真机；macOS 宿主上与系统内部调用冲突，不装）
+        // 导入链路诊断 + iOS 26 兼容修复（仅 iOS 真机）
+        // 3 参是 App 启动/导入实际调用的入口：hook 它才能接住异常并做备用写入
+        swizzle([NSFileManager class], @selector(copyItemAtPath:toPath:error:),
+                (IMP)new_copy3, (IMP *)&orig_copy3);
         swizzle([NSFileManager class], @selector(moveItemAtPath:toPath:error:),
                 (IMP)new_moveItemAtPath, (IMP *)&orig_moveItemAtPath);
         swizzle([NSFileManager class], @selector(createFileAtPath:contents:attributes:),
@@ -562,6 +639,6 @@ static void enhancer_init(void) {
                 (IMP)new_contentsOfDirectory, (IMP *)&orig_contentsOfDirectory);
         hook_document_picker();
 #endif
-        enh_log(@"enhancer v8 loaded (unarchive/handleUnzip/copy/move/createFile/listDir/documentPicker)");
+        enh_log(@"enhancer v10 loaded (copy3/copy4/move/createFile/listDir/documentPicker + fallback)");
     }
 }
