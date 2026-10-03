@@ -20,17 +20,18 @@ jobs:
           {
             set -x
             BROTLI_ALL=$(ls brotli/c/common/*.c brotli/c/dec/*.c brotli/c/enc/*.c)
-            clang -O2 -Ilz4/lib -Ibrotli/c/include \
+            clang -g -O1 -Ilz4/lib -Ibrotli/c/include \
               test_main.m \
               lz4/lib/lz4.c lz4/lib/lz4frame.c lz4/lib/lz4hc.c lz4/lib/xxhash.c \
               $BROTLI_ALL \
               -framework Foundation -lz -lbz2 \
               -o tester
-            ./tester
+            ./tester || true
           } > test.log 2>&1
           cat test.log
           if ! grep -q 'FAIL 0' test.log; then
-            echo 'TESTS FAILED'
+            echo '=== TESTS FAILED, lldb backtrace ==='
+            lldb -b -o 'run' -o 'thread backtrace' -o 'quit' ./tester 2>&1 | tail -45 || true
             exit 42
           fi
 
