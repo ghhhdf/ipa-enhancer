@@ -1,0 +1,48 @@
+name: build
+on: [push, workflow_dispatch]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch lz4 + brotli sources
+        run: |
+          git clone --depth 1 https://github.com/lz4/lz4.git
+          git clone --depth 1 https://github.com/google/brotli.git
+
+      - name: Build dylib (arm64, iPhoneOS SDK)
+        run: |
+          set -e
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          BROTLI_SRC=$(ls brotli/c/common/*.c brotli/c/dec/*.c)
+          xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=11.0 \
+            -dynamiclib -O2 \
+            -Ilz4/lib -Ibrotli/c/include \
+            enhancer.m \
+            lz4/lib/lz4.c lz4/lib/lz4frame.c lz4/lib/lz4hc.c lz4/lib/xxhash.c \
+            $BROTLI_SRC \
+            -framework Foundation \
+            -lz -lbz2 \
+            -install_name @executable_path/libipaenhancer.dylib \
+            -Wl,-headerpad_max_install_names \
+            -o libipaenhancer.dylib
+          file libipaenhancer.dylib
+          ls -la libipaenhancer.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libipaenhancer
+          path: libipaenhancer.dylib
+
+      - name: Publish to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: dylib build ${{ github.run_number }}
+          files: libipaenhancer.dylib
