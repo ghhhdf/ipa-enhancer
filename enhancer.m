@@ -22,7 +22,22 @@
 #import "zlib.h"
 #import "bzlib.h"
 
+// ---------------- 通用流式解码骨架 ----------------
+
 #define BUF_SIZE (1 << 20) // 1MB，与安卓版缓冲一致
+
+static BOOL copy_stream(FILE *in, FILE *out, NSError **errOut, NSString *label) {
+    static uint8_t buf[BUF_SIZE];
+    size_t n;
+    while ((n = fread(buf, 1, BUF_SIZE, in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            if (errOut) *errOut = [NSError errorWithDomain:@"ipaenhancer" code:-1
+                userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithFormat:@"%@: 写出失败", label]}];
+            return NO;
+        }
+    }
+    return YES;
+}
 
 // ---------------- LZ4 frame ----------------
 
@@ -61,6 +76,7 @@ static BOOL decode_lz4(NSString *src, NSString *dst, NSError **errOut) {
         if (!ok) break;
         if (feof(in)) break;
     }
+    // 校验收尾：输入耗尽且返回 0 才算完整
     LZ4F_freeDecompressionContext(dctx);
     fclose(in);
     if (fclose(out) != 0) ok = NO;
@@ -233,7 +249,7 @@ static NSString *uniqueDst(NSString *dir, NSString *name) {
 
 // ---------------- swizzle 实现 ----------------
 
-// 原 unarchiveFile:desDir:progressBlock:compeleteBlock: 实现
+// 原 unarchiveFile:desDir:progressBlock:compeleteBlock: 实现（交换后名叫 new_unarchiveFile:）
 static void (*orig_unarchiveFile)(id self, SEL _cmd, NSString *src, NSString *desDir,
                                   id progressBlock, id completeBlock);
 static void new_unarchiveFile(id self, SEL _cmd, NSString *src, NSString *desDir,
@@ -296,15 +312,45 @@ static void swizzle(Class cls, SEL sel, IMP newImp, IMP *origOut) {
     method_setImplementation(m, newImp);
 }
 
+// ---------------- iOS 26 兼容性防护：NSFileManager.copyItemAtPath ----------------
+// 实测（原版对照同现）：App 6.3.7 在 iOS 26.5 上启动资源拷贝抛异常致闪退、导入文件静默失败。
+// 对策：①目标已存在 → 幂等返回 YES（App 语义是"确保文件就位"）
+//      ②异常一律捕获转普通失败返回，绝不让异常逃逸
+static BOOL (*orig_copyItemAtPath)(id self, SEL _cmd, NSString *src, NSString *dst, NSUInteger options, NSError **error);
+static BOOL new_copyItemAtPath(id self, SEL _cmd, NSString *src, NSString *dst, NSUInteger options, NSError **error) {
+    @try {
+        if (src && dst) {
+            if ([(NSFileManager *)self fileExistsAtPath:dst]) {
+                if (error) *error = nil;
+                return YES; // 目标已就位，幂等成功
+            }
+        }
+    } @catch (NSException *e) {}
+    @try {
+        return orig_copyItemAtPath(self, _cmd, src, dst, options, error);
+    } @catch (NSException *e) {
+        if ([e.name isEqualToString:@"NSFileAlreadyExistsException"]) {
+            if (error) *error = nil;
+            return YES;
+        }
+        if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:-1
+            userInfo:@{NSLocalizedDescriptionKey: e.reason ?: @"copy failed"}];
+        return NO;
+    }
+}
+
 __attribute__((constructor))
 static void enhancer_init(void) {
     @autoreleasepool {
-        // constructor 时 dyld 已完成主二进制 ObjC 类注册
+        // 等主二进制 ObjC 类已注册（constructor 时 dyld 已完成类注册）
         Class wrapper = NSClassFromString(@"ZMUnzipZipWrapper");
         Class vc = NSClassFromString(@"ZMFileMainViewController");
         swizzle(wrapper, @selector(unarchiveFile:desDir:progressBlock:compeleteBlock:),
                 (IMP)new_unarchiveFile, (IMP *)&orig_unarchiveFile);
         swizzle(vc, @selector(handleUnzip:),
                 (IMP)new_handleUnzip, (IMP *)&orig_handleUnzip);
+        // iOS 26 兼容防护：App 启动/导入的文件拷贝抛异常 → 闪退/导入失败
+        swizzle([NSFileManager class], @selector(copyItemAtPath:toPath:options:error:),
+                (IMP)new_copyItemAtPath, (IMP *)&orig_copyItemAtPath);
     }
 }
