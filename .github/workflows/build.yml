@@ -30,7 +30,7 @@ jobs:
               $BROTLI_SRC \
               -framework Foundation \
               -lz -lbz2 \
-              -install_name @executable_path/libipaenhancer.dylib \
+              -install_name @executable_path/Frameworks/libipaenhancer.dylib \
               -Wl,-headerpad_max_install_names \
               -o libipaenhancer.dylib
             file libipaenhancer.dylib
