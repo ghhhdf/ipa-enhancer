@@ -336,8 +336,7 @@ static void enh_log(NSString *fmt, ...) {
     NSString *out = [NSString stringWithFormat:@"[%lld] %@\n",
                      (long long)[[NSDate date] timeIntervalSince1970], line];
     NSData *d = [out dataUsingEncoding:NSUTF8StringEncoding];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSFileHandle *fh = [fm fileHandleForWritingAtPath:logPath];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
     if (fh) {
         [fh seekToEndOfFile];
         [fh writeData:d];
@@ -349,9 +348,13 @@ static void enh_log(NSString *fmt, ...) {
 
 static BOOL new_copyItemAtPath(id self, SEL _cmd, NSString *src, NSString *dst, NSUInteger options, NSError **error) {
     BOOL startedScope = NO;
+    NSURL *srcURL = nil;
     @try {
-        if ([src respondsToSelector:@selector(startAccessingSecurityScopedResource)]) {
-            startedScope = [src startAccessingSecurityScopedResource];
+        if (src) {
+            srcURL = [NSURL fileURLWithPath:src];
+            if ([srcURL respondsToSelector:@selector(startAccessingSecurityScopedResource)]) {
+                startedScope = [srcURL startAccessingSecurityScopedResource];
+            }
         }
     } @catch (NSException *e) { startedScope = NO; }
 
@@ -384,7 +387,7 @@ static BOOL new_copyItemAtPath(id self, SEL _cmd, NSString *src, NSString *dst, 
     }
 done:
     if (startedScope) {
-        @try { [src stopAccessingSecurityScopedResource]; } @catch (NSException *e) {}
+        @try { [srcURL stopAccessingSecurityScopedResource]; } @catch (NSException *e) {}
     }
     return result;
 }
