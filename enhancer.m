@@ -15,6 +15,10 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
+#import <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#import <UIKit/UIKit.h>
+#endif
 
 #import "lz4frame.h"
 #import "lz4.h"
@@ -317,8 +321,9 @@ static void swizzle(Class cls, SEL sel, IMP newImp, IMP *origOut) {
 // 实测（原版对照同现）：App 6.3.7 在 iOS 26.5 上启动资源拷贝抛异常致闪退、导入文件静默失败。
 // 对策：①目标已存在 → 幂等返回 YES（App 语义是"确保文件就位"）
 //      ②源文件自动取得安全作用域权限（iOS 文件选择器选中的文件需 startAccessing 才可读）
-//      ③异常一律捕获转普通失败返回，绝不让异常逃逸
-//      ④关键调用写诊断日志到 Documents/ipaenhancer.log（可通过文件共享导出）
+//      ③系统拷贝失败 → 备用 NSData 直写绕过限制
+//      ④异常一律捕获转普通失败返回，绝不让异常逃逸
+//      ⑤关键调用写诊断日志到 Documents/ipaenhancer.log，失败时 App 内弹窗显示原因
 static BOOL (*orig_copyItemAtPath)(id self, SEL _cmd, NSString *src, NSString *dst, NSUInteger options, NSError **error);
 
 static void enh_log(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
@@ -347,6 +352,38 @@ static void enh_log(NSString *fmt, ...) {
     }
 }
 
+// 诊断弹窗：拷贝失败时在 App 内直接显示原因（无需数据线即可反馈）
+static void enh_alert(NSString *title, NSString *msg) {
+#if TARGET_OS_IPHONE
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            Class alertCls = NSClassFromString(@"UIAlertController");
+            Class sceneCls = NSClassFromString(@"UIWindowScene");
+            if (!alertCls || !sceneCls) return;
+            id alert = [alertCls alertControllerWithTitle:title message:msg
+                preferredStyle:UIAlertControllerStyleAlert];
+            id app = [[UIApplication class] performSelector:@selector(sharedApplication)];
+            id scenes = [app performSelector:@selector(connectedScenes)];
+            id active = nil;
+            for (id scene in scenes) {
+                if ([[scene valueForKey:@"activationState"] intValue] == 0) continue; // unattached
+                if ([[scene valueForKey:@"activationState"] intValue] == 2) { active = scene; break; } // foregroundActive
+            }
+            if (!active) return;
+            id win = [active valueForKey:@"keyWindow"];
+            id vc = [win valueForKey:@"rootViewController"];
+            if (!vc) return;
+            while ([vc respondsToSelector:@selector(presentedViewController)] &&
+                   [vc performSelector:@selector(presentedViewController)]) {
+                vc = [vc performSelector:@selector(presentedViewController)];
+            }
+            [vc performSelector:@selector(presentViewController:animated:completion:)
+                     withObject:alert withObject:nil withObject:nil];
+        } @catch (NSException *e) {}
+    });
+#endif
+}
+
 static BOOL new_copyItemAtPath(id self, SEL _cmd, NSString *src, NSString *dst, NSUInteger options, NSError **error) {
     BOOL startedScope = NO;
     NSURL *srcURL = nil;
@@ -361,6 +398,7 @@ static BOOL new_copyItemAtPath(id self, SEL _cmd, NSString *src, NSString *dst, 
 
     BOOL result = NO;
     NSError *localErr = nil;
+    NSString *failMsg = nil;
     @try {
         if (src && dst) {
             if ([(NSFileManager *)self fileExistsAtPath:dst]) {
@@ -375,20 +413,56 @@ static BOOL new_copyItemAtPath(id self, SEL _cmd, NSString *src, NSString *dst, 
                 result ? @"YES" : @"NO",
                 localErr.localizedDescription ?: @"-", src, dst, startedScope);
         if (!result && error && localErr) *error = localErr;
+        if (!result) failMsg = localErr.localizedDescription ?: @"系统拷贝返回失败";
     } @catch (NSException *e) {
         enh_log(@"copy: EXCEPTION %@ (%@) src=%@ dst=%@ scope=%d", e.name, e.reason ?: @"-", src, dst, startedScope);
         if ([e.name isEqualToString:@"NSFileAlreadyExistsException"]) {
             if (error) *error = nil;
             result = YES;
-        } else {
-            if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:-1
-                userInfo:@{NSLocalizedDescriptionKey: e.reason ?: @"copy failed"}];
-            result = NO;
+            goto done;
+        }
+        failMsg = [NSString stringWithFormat:@"%@: %@", e.name, e.reason ?: @"-"];
+        if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:-1
+            userInfo:@{NSLocalizedDescriptionKey: failMsg}];
+        result = NO;
+    }
+
+    // ---- 备用写入：绕过系统拷贝限制（NSData 读源 → 直接写目标，仅普通文件）----
+    if (!result) {
+        @try {
+            NSFileManager *fm = (NSFileManager *)self;
+            BOOL isDir = NO;
+            if ([fm fileExistsAtPath:src isDirectory:&isDir] && !isDir) {
+                NSData *bytes = [NSData dataWithContentsOfFile:src];
+                if (bytes) {
+                    NSString *parent = [dst stringByDeletingLastPathComponent];
+                    if (parent.length) [fm createDirectoryAtPath:parent withIntermediateDirectories:YES attributes:nil error:nil];
+                    if ([bytes writeToFile:dst atomically:YES]) {
+                        enh_log(@"copy: FALLBACK NSData 写入成功 src=%@ dst=%@", src.lastPathComponent, dst.lastPathComponent);
+                        if (error) *error = nil;
+                        result = YES;
+                        goto done;
+                    } else {
+                        enh_log(@"copy: FALLBACK 写入失败 dst=%@", dst);
+                        failMsg = @"备用写入也失败（目标目录不可写？）";
+                    }
+                } else {
+                    enh_log(@"copy: FALLBACK 读源失败 src=%@", src);
+                    failMsg = @"备用方式读取源文件失败";
+                }
+            }
+        } @catch (NSException *e) {
+            enh_log(@"copy: FALLBACK EXCEPTION %@", e.reason ?: e.name);
         }
     }
+
 done:
     if (startedScope) {
         @try { [srcURL stopAccessingSecurityScopedResource]; } @catch (NSException *e) {}
+    }
+    if (!result && failMsg) {
+        enh_alert(@"解压专家·导入诊断", [NSString stringWithFormat:@"文件拷贝失败\n\n来源: %@\n目标: %@\n原因: %@",
+                  src.lastPathComponent ?: @"-", dst.lastPathComponent ?: @"-", failMsg]);
     }
     return result;
 }
@@ -406,6 +480,6 @@ static void enhancer_init(void) {
         // iOS 26 兼容防护：App 启动/导入的文件拷贝抛异常 → 闪退/导入失败
         swizzle([NSFileManager class], @selector(copyItemAtPath:toPath:options:error:),
                 (IMP)new_copyItemAtPath, (IMP *)&orig_copyItemAtPath);
-        enh_log(@"enhancer v5 loaded (swizzle: unarchiveFile/handleUnzip/copyItemAtPath)");
+        enh_log(@"enhancer v7 loaded (swizzle: unarchiveFile/handleUnzip/copyItemAtPath+FALLBACK)");
     }
 }
