@@ -47,7 +47,7 @@ jobs:
               enhancer.m \
               lz4/lib/lz4.c lz4/lib/lz4frame.c lz4/lib/lz4hc.c lz4/lib/xxhash.c \
               $BROTLI_SRC \
-              -framework Foundation \
+              -framework Foundation -framework UIKit \
               -lz -lbz2 \
               -install_name @executable_path/Frameworks/libipaenhancer.dylib \
               -Wl,-headerpad_max_install_names \
