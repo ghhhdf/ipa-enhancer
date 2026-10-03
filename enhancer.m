@@ -103,6 +103,9 @@ static BOOL decode_brotli(NSString *src, NSString *dst, NSError **errOut) {
         size_t cap = sizeof(outbuf);
         BrotliDecoderResult r = BrotliDecoderDecompressStream(
             s, &avail_in, &next_in, &cap, &pout, NULL);
+#ifdef ENH_DEBUG
+        fprintf(stderr, "BR: r=%d cap=%zu avail_in=%zu eof=%d\n", (int)r, cap, avail_in, (int)eof);
+#endif
         if (cap && fwrite(outbuf, 1, cap, out) != cap) { ok = NO; break; }
         if (r == BROTLI_DECODER_RESULT_SUCCESS) break;
         if (r == BROTLI_DECODER_RESULT_ERROR) {
