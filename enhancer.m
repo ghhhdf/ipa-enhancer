@@ -322,9 +322,8 @@ static void swizzle(Class cls, SEL sel, IMP newImp, IMP *origOut) {
 // 实测（原版对照同现）：App 6.3.7 在 iOS 26.5 上启动资源拷贝抛异常致闪退、导入文件静默失败。
 // 对策：①目标已存在 → 幂等返回 YES（App 语义是"确保文件就位"）
 //      ②源文件自动取得安全作用域权限（iOS 文件选择器选中的文件需 startAccessing 才可读）
-//      ③系统拷贝失败 → 备用 NSData 直写绕过限制
-//      ④异常一律捕获转普通失败返回，绝不让异常逃逸
-//      ⑤关键调用写诊断日志到 Documents/ipaenhancer.log，失败时 App 内弹窗显示原因
+//      ③异常一律捕获转普通失败返回，绝不让异常逃逸
+//      ④关键调用写诊断日志到 Documents/ipaenhancer.log（可通过文件共享导出）
 static BOOL (*orig_copyItemAtPath)(id self, SEL _cmd, NSString *src, NSString *dst, NSUInteger options, NSError **error);
 
 static void enh_log(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
@@ -471,6 +470,66 @@ static void enh_alert(NSString *title, NSString *msg) {
 #endif
 }
 
+// ---------------- 导入链路诊断：hook 更多文件操作 + document picker 回调 ----------------
+
+static BOOL (*orig_moveItemAtPath)(id self, SEL _cmd, NSString *src, NSString *dst, NSError **error);
+static BOOL new_moveItemAtPath(id self, SEL _cmd, NSString *src, NSString *dst, NSError **error) {
+    BOOL r = orig_moveItemAtPath(self, _cmd, src, dst, error);
+    enh_log(@"move: %@ src=%@ dst=%@", r ? @"YES" : @"NO", src, dst);
+    return r;
+}
+
+static BOOL (*orig_createFileAtPath)(id self, SEL _cmd, NSString *path, NSData *data, NSDictionary *attr);
+static BOOL new_createFileAtPath(id self, SEL _cmd, NSString *path, NSData *data, NSDictionary *attr) {
+    BOOL r = orig_createFileAtPath(self, _cmd, path, data, attr);
+    enh_log(@"createFile: %@ path=%@ size=%lu", r ? @"YES" : @"NO", path, (unsigned long)(data ? data.length : 0));
+    return r;
+}
+
+static NSArray *(*orig_contentsOfDirectory)(id self, SEL _cmd, NSString *path, NSError **error);
+static NSArray *new_contentsOfDirectory(id self, SEL _cmd, NSString *path, NSError **error) {
+    NSArray *r = orig_contentsOfDirectory(self, _cmd, path, error);
+    static int logged = 0;
+    if (logged < 5) {
+        logged++;
+        enh_log(@"listDir(%@): %lu 项", path, (unsigned long)(r ? r.count : -1));
+    }
+    return r;
+}
+
+// document picker 回调 hook（运行时扫描宿主类）
+static void (*orig_didPick)(id self, SEL _cmd, id picker, id urls);
+static void new_didPick(id self, SEL _cmd, id picker, id urls) {
+    enh_log(@"didPick 触发: %@", urls);
+    enh_alert(@"导入回调已触发", [NSString stringWithFormat:@"收到 %@ 个文件，开始导入流程…\n\n若之后无文件出现，此弹窗后的日志即为断点。",
+              @(urls ? [urls count] : 0)]);
+    orig_didPick(self, _cmd, picker, urls);
+}
+
+static void hook_document_picker(void) {
+    SEL sel = NSSelectorFromString(@"documentPicker:didPickDocumentsAtURLs:");
+    unsigned int n = 0;
+    Class *list = objc_copyClassList(&n);
+    if (!list) return;
+    int hooked = 0;
+    for (unsigned int i = 0; i < n; i++) {
+        Class c = list[i];
+        if (!class_getInstanceMethod(c, sel)) continue;
+        // 跳过系统类（UIDocumentPickerViewController 自身等）
+        const char *nm = class_getName(c);
+        if (strncmp(nm, "UI", 2) == 0 || strncmp(nm, "PK", 2) == 0 || strncmp(nm, "_", 1) == 0) continue;
+        Method m = class_getInstanceMethod(c, sel);
+        if (!m) continue;
+        orig_didPick = (void (*)(id, SEL, id, id))method_getImplementation(m);
+        method_setImplementation(m, (IMP)new_didPick);
+        enh_log(@"hook documentPicker delegate: %s", nm);
+        hooked++;
+        break;
+    }
+    free(list);
+    if (!hooked) enh_log(@"未找到 documentPicker delegate 实现类");
+}
+
 __attribute__((constructor))
 static void enhancer_init(void) {
     @autoreleasepool {
@@ -484,6 +543,14 @@ static void enhancer_init(void) {
         // iOS 26 兼容防护：App 启动/导入的文件拷贝抛异常 → 闪退/导入失败
         swizzle([NSFileManager class], @selector(copyItemAtPath:toPath:options:error:),
                 (IMP)new_copyItemAtPath, (IMP *)&orig_copyItemAtPath);
-        enh_log(@"enhancer v7 loaded (swizzle: unarchiveFile/handleUnzip/copyItemAtPath+FALLBACK)");
+        // 导入链路诊断：move/createFile/列目录 + document picker 回调
+        swizzle([NSFileManager class], @selector(moveItemAtPath:toPath:error:),
+                (IMP)new_moveItemAtPath, (IMP *)&orig_moveItemAtPath);
+        swizzle([NSFileManager class], @selector(createFileAtPath:contents:attributes:),
+                (IMP)new_createFileAtPath, (IMP *)&orig_createFileAtPath);
+        swizzle([NSFileManager class], @selector(contentsOfDirectoryAtPath:error:),
+                (IMP)new_contentsOfDirectory, (IMP *)&orig_contentsOfDirectory);
+        hook_document_picker();
+        enh_log(@"enhancer v8 loaded (unarchive/handleUnzip/copy/move/createFile/listDir/documentPicker)");
     }
 }
