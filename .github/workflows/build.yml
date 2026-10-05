@@ -20,7 +20,7 @@ jobs:
             clang -g -O1 -Ilz4/lib \
               test_main.m \
               lz4/lib/lz4.c lz4/lib/lz4frame.c lz4/lib/lz4hc.c lz4/lib/xxhash.c \
-              -framework Foundation \
+              -framework Foundation -lz \
               -o tester
             ./tester || true
           } > test.log 2>&1
