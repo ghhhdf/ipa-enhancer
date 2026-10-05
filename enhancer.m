@@ -1,6 +1,5 @@
-// libipaenhancer v15 — lz4 解压 + 启动崩溃修复 + 魔数嗅探 + RAR5 volume 标志修补
-// 新增：实测部分发布包把单卷 RAR5 误设 volume 标志（main flags=0x05），unrar 找不到下一卷
-// 导致解出文件缺失（解压喵等不校验）。解出内层 .rar 后自动清除该位并重算 header CRC32。
+// libipaenhancer v15.1 — lz4 解压 + 启动崩溃修复 + 魔数嗅探 + RAR5 volume 标志修补
+// v15.1 修正：fixRarVolumeFlag 边界检查（文件可短于 16 字节，读满 15 即够）
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -275,7 +274,8 @@ static void fixRarVolumeFlag(NSString *path) {
     FILE *f = fopen(path.fileSystemRepresentation, "rb+");
     if (!f) return;
     uint8_t h[16];
-    if (fread(h, 1, 16, f) != 16) { fclose(f); return; }
+    size_t rn = fread(h, 1, 16, f);
+    if (rn < 15) { fclose(f); return; }         // 最短有效结构 15 字节
     if (memcmp(h, "Rar!\x1a\x07\x01\x00", 8) != 0) { fclose(f); return; } // 仅 RAR5
     if (h[13] != 0x01) { fclose(f); return; }   // main archive header
     if (h[14] != 0x05) { fclose(f); return; }   // flags = volume|solid 才修
@@ -373,6 +373,6 @@ static void enhancer_init(void) {
                 (IMP)new_copy4, (IMP *)&orig_copy4_base);
         swizzle([NSFileManager class], @selector(copyItemAtPath:toPath:error:),
                 (IMP)new_copy3, (IMP *)&orig_copy3_base);
-        enh_log(@"enhancer v15 loaded (lz4 + magic sniff + copy protection + rar5 volume fix)");
+        enh_log(@"enhancer v15.1 loaded (lz4 + magic sniff + copy protection + rar5 volume fix)");
     }
 }
