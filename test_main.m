@@ -1,219 +1,68 @@
-// test_main.m — enhancer 逻辑的 macOS 宿主测试
+// test_main.m v11 — 极简版测试：lz4 round-trip + 路由
 // #include "enhancer.m" 合并编译：可访问 static 函数，constructor 自动执行（swizzle 生效）
-// 在 macOS Foundation（与 iOS 同源实现）上验证：路由表 / 五格式解码 / 接力 / copyItemAtPath 防护
 #import <Foundation/Foundation.h>
 #import "enhancer.m"
 
-static int g_pass = 0, g_fail = 0;
-
-static void T(NSString *name, BOOL ok, NSString *detail) {
-    printf("  [%s] %s%s\n", ok ? "PASS" : "FAIL", name.UTF8String ?: "",
-           ok ? "" : [[NSString stringWithFormat:@" | %@", detail ?: @"-"] UTF8String]);
-    if (ok) g_pass++; else g_fail++;
+static int pass = 0, fails = 0;
+static void ck(BOOL ok, const char *label) {
+    printf("%s %s\n", ok ? "PASS" : "FAIL", label);
+    if (ok) pass++; else fails++;
 }
 
-static NSData *readFile(NSString *p) { return [NSData dataWithContentsOfFile:p]; }
-static BOOL writeFile(NSString *p, NSData *d) { return [d writeToFile:p atomically:YES]; }
-static BOOL eqDataOk(NSData *a, NSData *b) { return a && b && [a isEqualToData:b]; }
-static NSString *fnNameOf(DecoderFn fn) {
-    if (fn == decode_lz4) return @"lz4";
-    if (fn == decode_brotli) return @"brotli";
-    if (fn == decode_gzip) return @"gzip";
-    if (fn == decode_bzip2) return @"bzip2";
-    return nil;
-}
-
-// ---------- 1. 路由表 ----------
-static void test_routing(void) {
-    printf("== 路由表 ==\n");
-    struct { const char *in; const char *inner; const char *dec; } cases[] = {
-        {"data.7z.lz4",    "data.7z",    "lz4"},
-        {"BACKUP.ZIP.LZ4", "BACKUP.zip", "lz4"},
-        {"x.tar.lz4",      "x.tar",      "lz4"},
-        {"doc.tar.gz",     "doc.tar",    "gzip"},
-        {"img.TGZ",        "img.tar",    "gzip"},
-        {"f.tbz2",         "f.tar",      "bzip2"},
-        {"f.tar.bz2",      "f.tar",      "bzip2"},
-        {"plain.lz4",      "plain",      "lz4"},
-        {"a.gz",           "a",          "gzip"},
-        {"a.br",           "a",          "brotli"},
-        {"a.xz",           "a",          NULL},
-        {"noext",          NULL,         NULL},
-        {"a.7z",           NULL,         NULL},
-    };
-    int n = (int)(sizeof(cases) / sizeof(cases[0]));
-    for (int i = 0; i < n; i++) {
-        NSString *in = @(cases[i].in);
-        NSString *inner = nil;
-        DecoderFn fn = decoderFor(in, &inner);
-        NSString *fnName = fnNameOf(fn);
-        BOOL ok = (cases[i].inner ? [inner isEqualToString:@(cases[i].inner)] : inner == nil)
-               && (cases[i].dec ? [fnName isEqualToString:@(cases[i].dec)] : fnName == nil);
-        T([NSString stringWithFormat:@"route %s", cases[i].in], ok,
-          [NSString stringWithFormat:@"got inner=%@ dec=%@ want inner=%@ dec=%@",
-           inner ?: @"nil", fnName ?: @"放行",
-           cases[i].inner ? @(cases[i].inner) : @"nil",
-           cases[i].dec ? @(cases[i].dec) : @"放行"]);
-    }
-}
-
-// ---------- 2. lz4 round-trip + 双层 ----------
-static void test_lz4(void) {
-    printf("== lz4 round-trip ==\n");
-    NSMutableData *src = [NSMutableData dataWithCapacity:5 << 20];
-    srand(42);
-    for (int i = 0; i < (5 << 20) / 4; i++) {
-        uint32_t v = (i % 100 < 80) ? (uint32_t)(i % 7) : (uint32_t)rand();
-        [src appendBytes:&v length:4];
-    }
-    NSData *srcData = [src copy];
-    size_t cap = LZ4F_compressFrameBound(srcData.length, NULL);
-    NSMutableData *comp = [NSMutableData dataWithLength:cap];
-    size_t clen = LZ4F_compressFrame(comp.mutableBytes, cap, srcData.bytes, srcData.length, NULL);
-    if (LZ4F_isError(clen)) { T(@"lz4 compress", NO, @"frame error"); return; }
-    comp.length = clen;
-
-    NSString *srcP = [NSTemporaryDirectory() stringByAppendingPathComponent:@"t.lz4"];
-    NSString *dstP = [NSTemporaryDirectory() stringByAppendingPathComponent:@"t.out"];
-    writeFile(srcP, comp);
-    NSError *err = nil;
-    BOOL ok = decode_lz4(srcP, dstP, &err);
-    T(@"lz4 decode", ok, err.localizedDescription ?: @"-");
-    T(@"lz4 round-trip 内容一致", ok && eqDataOk(readFile(dstP), srcData), ok ? @"-" : @"内容不一致");
-
-    // 双层语义：payload.7z.lz4 → innerName=payload.7z → decode → 内容应为 7z 原始字节
-    NSString *fake = [NSTemporaryDirectory() stringByAppendingPathComponent:@"payload.7z.lz4"];
-    writeFile(fake, comp);
-    NSString *inner = nil;
-    DecoderFn fn = decoderFor(fake, &inner);
-    NSString *innerDst = [NSTemporaryDirectory() stringByAppendingPathComponent:(inner ?: @"x")];
-    ok = (fn != NULL) && [inner isEqualToString:@"payload.7z"] && decode_lz4(fake, innerDst, &err);
-    T(@".7z.lz4 双层接力命名+解码", ok,
-      [NSString stringWithFormat:@"inner=%@ err=%@", inner ?: @"nil", err.localizedDescription ?: @"-"]);
-}
-
-// ---------- 3. gz / bz2 / brotli round-trip ----------
-static void test_gz_bz2_br(void) {
-    printf("== gz / bz2 / brotli round-trip ==\n");
-    NSMutableData *src = [NSMutableData data];
-    for (int i = 0; i < 100000; i++) {
-        uint8_t b = (uint8_t)"hello world compress test 123 "[i % 29];
-        [src appendBytes:&b length:1];
-    }
-    NSData *srcData = [src copy];
-    NSString *dstP = [NSTemporaryDirectory() stringByAppendingPathComponent:@"rt.out"];
-    NSError *err = nil;
-
-    // gzip（zlib windowBits 31）
-    z_stream zs = {};
-    deflateInit2(&zs, 6, Z_DEFLATED, 31, 8, Z_DEFAULT_STRATEGY);
-    NSMutableData *gz = [NSMutableData dataWithLength:(NSUInteger)deflateBound(&zs, (uLong)srcData.length)];
-    zs.next_out = (Bytef *)gz.mutableBytes; zs.avail_out = (uInt)gz.length;
-    zs.next_in = (Bytef *)srcData.bytes; zs.avail_in = (uInt)srcData.length;
-    deflate(&zs, Z_FINISH); gz.length = (NSUInteger)zs.total_out; deflateEnd(&zs);
-    NSString *gp = [NSTemporaryDirectory() stringByAppendingPathComponent:@"rt.gz"];
-    writeFile(gp, gz);
-    BOOL ok = decode_gzip(gp, dstP, &err);
-    T(@"gz decode+round-trip", ok && eqDataOk(readFile(dstP), srcData), err.localizedDescription ?: @"-");
-
-    // bz2
-    unsigned int cb = (unsigned int)(srcData.length + srcData.length / 100 + 600);
-    NSMutableData *bz = [NSMutableData dataWithLength:cb];
-    unsigned int blen = cb;
-    BZ2_bzBuffToBuffCompress((char *)bz.mutableBytes, &blen,
-                             (char *)srcData.bytes, (unsigned int)srcData.length, 5, 0, 0);
-    bz.length = blen;
-    NSString *bp = [NSTemporaryDirectory() stringByAppendingPathComponent:@"rt.bz2"];
-    writeFile(bp, bz);
-    ok = decode_bzip2(bp, dstP, &err);
-    T(@"bz2 decode+round-trip", ok && eqDataOk(readFile(dstP), srcData), err.localizedDescription ?: @"-");
-
-    // brotli：内嵌固定样本（python brotli.compress 预生成 35B → 100KB，排除压缩端干扰）
-    static const uint8_t brComp[] = {
-        0x5b, 0x9f, 0x86, 0x01, 0x42, 0x11, 0x2a, 0xbd, 0x41, 0x62, 0x64, 0x66,
-        0xb4, 0x20, 0x83, 0x20, 0xf3, 0x99, 0x18, 0x35, 0xc5, 0x22, 0x4a, 0x31,
-        0x69, 0x42, 0xb9, 0xac, 0xc3, 0xd2, 0x3d, 0x7e, 0x01, 0xb6, 0x07,
-    };
-    NSData *brData = [NSData dataWithBytes:brComp length:sizeof(brComp)];
-    NSString *brp = [NSTemporaryDirectory() stringByAppendingPathComponent:@"rt.br"];
-    writeFile(brp, brData);
-    ok = decode_brotli(brp, dstP, &err);
-    NSData *brOut = readFile(dstP);
-    T(@"brotli decode（固定样本）", ok && eqDataOk(brOut, srcData),
-      [NSString stringWithFormat:@"ok=%d err=%@ out=%lu want=%lu",
-       ok, err.localizedDescription ?: @"-",
-       (unsigned long)brOut.length, (unsigned long)srcData.length]);
-}
-
-// ---------- 4. copyItemAtPath 防护（constructor 已 swizzle） ----------
-static void test_copy_protection(void) {
-    printf("== copyItemAtPath 防护 ==\n");
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"enhtest"];
-    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    NSString *src = [dir stringByAppendingPathComponent:@"src.bin"];
-    NSString *dst = [dir stringByAppendingPathComponent:@"dst.bin"];
-    writeFile(src, [@"payload-bytes" dataUsingEncoding:NSUTF8StringEncoding]);
-    [fm removeItemAtPath:dst error:nil];
-
-    NSError *err = nil;
-    BOOL ok = [fm copyItemAtPath:src toPath:dst error:&err];
-    T(@"copy 正常路径", ok, err.localizedDescription ?: @"-");
-
-    err = nil;
-    ok = [fm copyItemAtPath:src toPath:dst error:&err];
-    T(@"copy 目标已存在 → 幂等 YES", ok, err.localizedDescription ?: @"-");
-
-    err = nil;
-    NSString *dst2 = [dir stringByAppendingPathComponent:@"dst2.bin"]; // 独立目标，避免幂等分支干扰
-    ok = [fm copyItemAtPath:[dir stringByAppendingPathComponent:@"no-such-file.bin"]
-                      toPath:dst2 error:&err];
-    T(@"copy 源不存在 → NO 不崩", ok == NO, err.localizedDescription ?: @"-");
-}
-
-// ---------- 5. 双层接力端到端（tar.gz → tar） ----------
-static BOOL mkd(NSString *d) { return [[NSFileManager defaultManager] createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil]; }
-
-static void test_relay_targz(void) {
-    printf("== tar.gz 接力 ==\n");
-    NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"relay"];
-    mkd(dir);
-    writeFile([dir stringByAppendingPathComponent:@"a.txt"],
-              [@"tar content for relay test" dataUsingEncoding:NSUTF8StringEncoding]);
-    NSTask *tar = [[NSTask alloc] init];
-    tar.launchPath = @"/usr/bin/tar";
-    tar.arguments = @[@"-cf", @"arch.tar", @"a.txt"];
-    tar.currentDirectoryPath = dir;
-    [tar launch]; [tar waitUntilExit];
-
-    NSData *tarData = readFile([dir stringByAppendingPathComponent:@"arch.tar"]);
-    z_stream zs = {};
-    deflateInit2(&zs, 6, Z_DEFLATED, 31, 8, Z_DEFAULT_STRATEGY);
-    NSMutableData *gz = [NSMutableData dataWithLength:(NSUInteger)deflateBound(&zs, (uLong)tarData.length)];
-    zs.next_out = (Bytef *)gz.mutableBytes; zs.avail_out = (uInt)gz.length;
-    zs.next_in = (Bytef *)tarData.bytes; zs.avail_in = (uInt)tarData.length;
-    deflate(&zs, Z_FINISH); gz.length = (NSUInteger)zs.total_out; deflateEnd(&zs);
-    NSString *tgzP = [dir stringByAppendingPathComponent:@"arch.tar.gz"];
-    writeFile(tgzP, gz);
-
-    NSString *inner = nil;
-    DecoderFn fn = decoderFor(tgzP, &inner);
-    NSString *innerDst = [dir stringByAppendingPathComponent:(inner ?: @"x.tar")];
-    NSError *err = nil;
-    BOOL ok = (fn != NULL) && [inner isEqualToString:@"arch.tar"] && decode_gzip(tgzP, innerDst, &err);
-    T(@"tar.gz innerName+解码+内容一致", ok && eqDataOk(readFile(innerDst), tarData),
-      [NSString stringWithFormat:@"inner=%@ err=%@", inner ?: @"nil", err.localizedDescription ?: @"-"]);
-}
-
-int main(int argc, char **argv) {
+int main(void) {
     @autoreleasepool {
-        printf("=== libipaenhancer macOS 宿主测试 ===\n");
-        test_routing();
-        test_lz4();
-        test_gz_bz2_br();
-        test_copy_protection();
-        test_relay_targz();
-        printf("\n=== 汇总: PASS %d / FAIL %d ===\n", g_pass, g_fail);
-        return g_fail ? 1 : 0;
+        printf("=== libipaenhancer v11 测试 ===\n");
+        NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:
+            [[NSProcessInfo processInfo] globallyUniqueString]];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+            withIntermediateDirectories:YES attributes:nil error:nil];
+
+        // ---- 1) lz4 round-trip（LZ4F_compressFrame → decode_lz4）----
+        NSMutableString *big = [NSMutableString string];
+        for (int i = 0; i < 20000; i++)
+            [big appendString:@"预置中文测试 anohana LZ4 0123456789 abcdefgh\n"];
+        NSData *plain = [big dataUsingEncoding:NSUTF8StringEncoding];
+
+        size_t cap = LZ4F_compressFrameBound(plain.length, NULL);
+        uint8_t *buf = (uint8_t *)malloc(cap);
+        size_t clen = LZ4F_compressFrame(buf, cap, plain.bytes, plain.length, NULL);
+        ck(!LZ4F_isError(clen), "LZ4F_compressFrame");
+
+        NSString *lz4f = [dir stringByAppendingPathComponent:@"big.bin.lz4"];
+        NSString *out = [dir stringByAppendingPathComponent:@"big.out"];
+        [(NSData *)[NSData dataWithBytes:buf length:clen] writeToFile:lz4f atomically:YES];
+
+        NSError *err = nil;
+        BOOL ok = decode_lz4(lz4f, out, &err);
+        ck(ok, "decode_lz4 执行");
+        NSData *rt = [NSData dataWithContentsOfFile:out];
+        ck(rt && rt.length == plain.length && memcmp(rt.bytes, plain.bytes, plain.length) == 0,
+           "lz4 round-trip 逐字节一致");
+
+        // ---- 2) 损坏输入 → 正确报错 ----
+        NSString *bad = [dir stringByAppendingPathComponent:@"bad.lz4"];
+        [(NSData *)[NSData dataWithBytes:buf length:clen / 4] writeToFile:bad atomically:YES];
+        NSString *badOut = [dir stringByAppendingPathComponent:@"bad.out"];
+        BOOL badOk = decode_lz4(bad, badOut, &err);
+        ck(!badOk, "损坏 lz4 流正确报错（回退路径触发）");
+
+        // ---- 3) 路由（仅 lz4 家族命中，其余放行）----
+        NSString *inner = nil;
+        ck(decoderFor(@"/x/data.7z.lz4", &inner) != NULL && [inner isEqualToString:@"data.7z"],
+           "路由 .7z.lz4 → data.7z");
+        ck(decoderFor(@"/x/data.zip.lz4", &inner) != NULL && [inner isEqualToString:@"data.zip"],
+           "路由 .zip.lz4 → data.zip");
+        ck(decoderFor(@"/x/data.tar.lz4", &inner) != NULL && [inner isEqualToString:@"data.tar"],
+           "路由 .tar.lz4 → data.tar");
+        ck(decoderFor(@"/x/a.lz4", &inner) != NULL && [inner isEqualToString:@"a"],
+           "路由 .lz4 → a");
+        ck(decoderFor(@"/x/a.zip", &inner) == NULL, "放行 .zip（原逻辑）");
+        ck(decoderFor(@"/x/a.gz", &inner) == NULL, "放行 .gz（原逻辑）");
+        ck(decoderFor(@"/x/a.br", &inner) == NULL, "放行 .br（原逻辑）");
+        ck(decoderFor(@"/x/a.bz2", &inner) == NULL, "放行 .bz2（原逻辑）");
+        ck(decoderFor(@"/x/a.7z", &inner) == NULL, "放行 .7z（原逻辑）");
+
+        printf("汇总: PASS %d FAIL %d\n", pass, fails);
+        return fails ? 1 : 0;
     }
 }
