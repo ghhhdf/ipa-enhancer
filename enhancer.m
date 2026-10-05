@@ -1,8 +1,8 @@
-// libipaenhancer v12 — lz4 解压 + iOS 26/27 启动崩溃修复（类簇正确 hook）
-// 闪退真因（2026-10-05 对照包日志确认）：App 6.3.7 启动时 NSFileManager copyItemAtPath
-// 在 iOS 26.5+/27.0 抛异常（与注入无关，零修改重打包同样崩）。
-// 关键：NSFileManager 是类簇，defaultManager 实为 NSConcreteFileManager，自带实现——
-// swizzle 父类无效，必须 hook object_getClass(defaultManager) 上的真实 IMP。
+// libipaenhancer v13 — lz4 解压 + 启动崩溃修复 + 让 UI 认识 lz4
+// v12 修复了启动崩溃（hook defaultManager 真实类）✓ 用户确认能进 App
+// 本次：App 文件列表按类型表判定可解压文件，lz4 不在表内 → 显示为"其它"无解压选项。
+// 对策：hook supportArchiveTypeArray getter，追加 lz4 家族 → UI 出现解压入口 →
+//       点击走 handleUnzip/unarchiveFile → 我们的 lz4 hook 接力解出内层包。
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -17,8 +17,6 @@
 #define BUF_SIZE (1 << 20)
 
 typedef BOOL (*DecoderFn)(NSString *, NSString *, NSError **);
-
-// ---------------- lz4 解码 ----------------
 
 static BOOL decode_lz4(NSString *src, NSString *dst, NSError **errOut) {
     FILE *in = fopen(src.fileSystemRepresentation, "rb");
@@ -57,8 +55,6 @@ out:
     return ok;
 }
 
-// ---------------- 路由（仅 lz4 家族） ----------------
-
 static NSString *innerName(NSString *path) {
     NSString *name = path.lastPathComponent;
     NSString *low = name.lowercaseString;
@@ -92,8 +88,6 @@ static NSString *uniqueDst(NSString *dir, NSString *name) {
     }
     return nil;
 }
-
-// ---------------- 日志 ----------------
 
 static void enh_log(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
 static void enh_alert(NSString *title, NSString *msg);
@@ -148,9 +142,7 @@ static void enh_alert(NSString *title, NSString *msg) {
 #endif
 }
 
-// ---------------- copyItemAtPath 防护（修 iOS 26/27 启动崩溃 + 导入失败） ----------------
-// App 直接调 4 参版；NSConcreteFileManager 有自己的实现，必须 hook 其真实类。
-// 逻辑：dst 已存在→幂等 YES；异常捕获转失败；失败→NSData 备用直写；仍失败→弹窗。
+// ---------------- copyItemAtPath 防护（v12：类簇真实类 hook） ----------------
 
 static BOOL (*orig_copy4_concrete)(id, SEL, NSString *, NSString *, NSUInteger, NSError **);
 static BOOL (*orig_copy3_concrete)(id, SEL, NSString *, NSString *, NSError **);
@@ -170,12 +162,10 @@ static BOOL enh_fallback_copy(NSString *src, NSString *dst) {
     } @catch (NSException *e) { return NO; }
 }
 
-// 统一防护实现（concrete/base 共用；kind 仅用于日志）
 static BOOL enh_protected_copy(id self, NSString *src, NSString *dst, NSUInteger options,
                                NSError **error, BOOL hasOptions, const char *kind) {
     static _Thread_local int in_prot = 0;
     if (in_prot) {
-        // 重入：直接调系统原始实现（避免 wrapper 互调递归）
         @try {
             if (hasOptions) return orig_copy4_concrete(self, @selector(copyItemAtPath:toPath:options:error:),
                                                        src, dst, options, error);
@@ -285,6 +275,48 @@ static void new_handleUnzip(id self, SEL _cmd, NSString *path) {
     orig_handleUnzip(self, _cmd, path);
 }
 
+// ---------------- UI 类型表：让 App 把 lz4 家族当压缩包 ----------------
+// supportArchiveTypeArray getter（静态侦察确认存在）返回支持的解压扩展名数组。
+// hook 后追加 lz4 家族；同时把原数组内容写日志，便于适配元素格式。
+
+static NSArray *(*orig_supportTypes)(id, SEL);
+static NSArray *new_supportTypes(id self, SEL _cmd) {
+    NSArray *r = orig_supportTypes(self, _cmd);
+    static NSArray *extra = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        extra = @[@"lz4", @".lz4", @"7z.lz4", @".7z.lz4", @"zip.lz4", @".zip.lz4",
+                  @"tar.lz4", @".tar.lz4"];
+        enh_log(@"supportArchiveTypeArray 原内容: %@", r);
+    });
+    if ([r isKindOfClass:[NSArray class]]) return [r arrayByAddingObjectsFromArray:extra];
+    return r;
+}
+
+static void hook_support_types(void) {
+    SEL sel = NSSelectorFromString(@"supportArchiveTypeArray");
+    unsigned int n = 0;
+    Class *list = objc_copyClassList(&n);
+    if (!list) return;
+    int hooked = 0;
+    for (unsigned int i = 0; i < n; i++) {
+        Class c = list[i];
+        if (!class_getInstanceMethod(c, sel)) continue;
+        const char *nm = class_getName(c);
+        if (strncmp(nm, "UI", 2) == 0 || strncmp(nm, "_", 1) == 0) continue;
+        Method m = class_getInstanceMethod(c, sel);
+        if (!m) continue;
+        // 只 hook 最具体的实现（避免父类子类重复 hook 打日志混乱）
+        if (class_getInstanceMethod(class_getSuperclass(c), sel) == m) continue;
+        orig_supportTypes = (NSArray *(*)(id, SEL))method_getImplementation(m);
+        method_setImplementation(m, (IMP)new_supportTypes);
+        enh_log(@"hook supportArchiveTypeArray: %s", nm);
+        hooked++;
+    }
+    free(list);
+    if (!hooked) enh_log(@"未找到 supportArchiveTypeArray 实现类");
+}
+
 static void swizzle(Class cls, SEL sel, IMP newImp, IMP *origOut) {
     if (!cls) return;
     Method m = class_getInstanceMethod(cls, sel);
@@ -297,14 +329,12 @@ static void swizzle(Class cls, SEL sel, IMP newImp, IMP *origOut) {
 __attribute__((constructor))
 static void enhancer_init(void) {
     @autoreleasepool {
-        // 1) lz4 双层接力
         Class wrapper = NSClassFromString(@"ZMUnzipZipWrapper");
         Class vc = NSClassFromString(@"ZMFileMainViewController");
         swizzle(wrapper, @selector(unarchiveFile:desDir:progressBlock:compeleteBlock:),
                 (IMP)new_unarchiveFile, (IMP *)&orig_unarchiveFile);
         swizzle(vc, @selector(handleUnzip:),
                 (IMP)new_handleUnzip, (IMP *)&orig_handleUnzip);
-        // 2) copyItemAtPath 防护：hook defaultManager 的真实类（类簇关键修复）+ 父类兜底
         Class concrete = object_getClass([NSFileManager defaultManager]);
         swizzle(concrete, @selector(copyItemAtPath:toPath:options:error:),
                 (IMP)new_copy4, (IMP *)&orig_copy4_concrete);
@@ -314,6 +344,7 @@ static void enhancer_init(void) {
                 (IMP)new_copy4, (IMP *)&orig_copy4_base);
         swizzle([NSFileManager class], @selector(copyItemAtPath:toPath:error:),
                 (IMP)new_copy3, (IMP *)&orig_copy3_base);
-        enh_log(@"enhancer v12 loaded (lz4 + copy protection on %s)", class_getName(concrete));
+        hook_support_types();
+        enh_log(@"enhancer v13 loaded (lz4 + copy protection + UI type injection)");
     }
 }
