@@ -1,8 +1,8 @@
-// libipaenhancer v13 — lz4 解压 + 启动崩溃修复 + 让 UI 认识 lz4
-// v12 修复了启动崩溃（hook defaultManager 真实类）✓ 用户确认能进 App
-// 本次：App 文件列表按类型表判定可解压文件，lz4 不在表内 → 显示为"其它"无解压选项。
-// 对策：hook supportArchiveTypeArray getter，追加 lz4 家族 → UI 出现解压入口 →
-//       点击走 handleUnzip/unarchiveFile → 我们的 lz4 hook 接力解出内层包。
+// libipaenhancer v13.1 — lz4 解压 + 启动崩溃修复 + UI 类型表注入（安全闸门版）
+// v13 闪退原因：App 类型表元素可能是自定义对象（非 NSString），直接追加 NSString
+// 会让调用方调用不存在的选择器 → 崩溃。
+// v13.1：注入前先检查元素类型——是 NSString 才追加（安全）；否则记录原表内容后
+// 原样返回（不崩），日志中的元素类信息用于下一轮精准适配。
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -142,7 +142,7 @@ static void enh_alert(NSString *title, NSString *msg) {
 #endif
 }
 
-// ---------------- copyItemAtPath 防护（v12：类簇真实类 hook） ----------------
+// ---------------- copyItemAtPath 防护（类簇真实类 hook，修 iOS 26/27 启动崩溃） ----------------
 
 static BOOL (*orig_copy4_concrete)(id, SEL, NSString *, NSString *, NSUInteger, NSError **);
 static BOOL (*orig_copy3_concrete)(id, SEL, NSString *, NSString *, NSError **);
@@ -275,9 +275,7 @@ static void new_handleUnzip(id self, SEL _cmd, NSString *path) {
     orig_handleUnzip(self, _cmd, path);
 }
 
-// ---------------- UI 类型表：让 App 把 lz4 家族当压缩包 ----------------
-// supportArchiveTypeArray getter（静态侦察确认存在）返回支持的解压扩展名数组。
-// hook 后追加 lz4 家族；同时把原数组内容写日志，便于适配元素格式。
+// ---------------- UI 类型表：让 App 把 lz4 家族当压缩包（安全闸门版） ----------------
 
 static NSArray *(*orig_supportTypes)(id, SEL);
 static NSArray *new_supportTypes(id self, SEL _cmd) {
@@ -287,9 +285,13 @@ static NSArray *new_supportTypes(id self, SEL _cmd) {
     dispatch_once(&once, ^{
         extra = @[@"lz4", @".lz4", @"7z.lz4", @".7z.lz4", @"zip.lz4", @".zip.lz4",
                   @"tar.lz4", @".tar.lz4"];
-        enh_log(@"supportArchiveTypeArray 原内容: %@", r);
+        enh_log(@"supportArchiveTypeArray 原内容: %@ (元素类: %@)", r, r.count ? NSStringFromClass([r[0] class]) : @"空");
     });
-    if ([r isKindOfClass:[NSArray class]]) return [r arrayByAddingObjectsFromArray:extra];
+    // 安全闸门：仅当元素是 NSString 时才追加（自定义对象类型表会因不识别 NSString 崩溃）
+    if ([r isKindOfClass:[NSArray class]] && r.count > 0 &&
+        [r[0] isKindOfClass:[NSString class]]) {
+        return [r arrayByAddingObjectsFromArray:extra];
+    }
     return r;
 }
 
@@ -306,7 +308,6 @@ static void hook_support_types(void) {
         if (strncmp(nm, "UI", 2) == 0 || strncmp(nm, "_", 1) == 0) continue;
         Method m = class_getInstanceMethod(c, sel);
         if (!m) continue;
-        // 只 hook 最具体的实现（避免父类子类重复 hook 打日志混乱）
         if (class_getInstanceMethod(class_getSuperclass(c), sel) == m) continue;
         orig_supportTypes = (NSArray *(*)(id, SEL))method_getImplementation(m);
         method_setImplementation(m, (IMP)new_supportTypes);
@@ -345,6 +346,6 @@ static void enhancer_init(void) {
         swizzle([NSFileManager class], @selector(copyItemAtPath:toPath:error:),
                 (IMP)new_copy3, (IMP *)&orig_copy3_base);
         hook_support_types();
-        enh_log(@"enhancer v13 loaded (lz4 + copy protection + UI type injection)");
+        enh_log(@"enhancer v13.1 loaded (lz4 + copy protection + UI type injection w/ guard)");
     }
 }
