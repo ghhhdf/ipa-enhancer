@@ -1,5 +1,6 @@
-// libipaenhancer v15.1 — lz4 解压 + 启动崩溃修复 + 魔数嗅探 + RAR5 volume 标志修补
-// v15.1 修正：fixRarVolumeFlag 边界检查（文件可短于 16 字节，读满 15 即够）
+// libipaenhancer v15.2 — lz4 解压 + 启动崩溃修复 + 魔数嗅探 + RAR5 volume 标志修补
+// v15.2：enh_log 去掉 static logPath 缓存（静态变量被越界写污染曾致 NSURL length 崩溃），
+// 每次实时查询 Documents 路径。
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -112,12 +113,9 @@ static NSString *uniqueDst(NSString *dir, NSString *name) {
 static void enh_log(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
 static void enh_alert(NSString *title, NSString *msg);
 static void enh_log(NSString *fmt, ...) {
-    static NSString *logPath = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-        if (docs) logPath = [docs stringByAppendingPathComponent:@"ipaenhancer.log"];
-    });
+    // 注意：不用 static 缓存 logPath——静态变量可能被相邻越界写污染（曾致 NSURL length 崩溃）
+    NSString *logPath = [[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)
+                          firstObject] stringByAppendingPathComponent:@"ipaenhancer.log"];
     if (!logPath) return;
     va_list args;
     va_start(args, fmt);
@@ -373,6 +371,6 @@ static void enhancer_init(void) {
                 (IMP)new_copy4, (IMP *)&orig_copy4_base);
         swizzle([NSFileManager class], @selector(copyItemAtPath:toPath:error:),
                 (IMP)new_copy3, (IMP *)&orig_copy3_base);
-        enh_log(@"enhancer v15.1 loaded (lz4 + magic sniff + copy protection + rar5 volume fix)");
+        enh_log(@"enhancer v15.2 loaded (lz4 + magic sniff + copy protection + rar5 volume fix)");
     }
 }
