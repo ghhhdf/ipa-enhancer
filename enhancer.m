@@ -1,8 +1,6 @@
-// libipaenhancer v14 — lz4 解压 + 启动崩溃修复 + 魔数嗅探（零 UI 侵入）
-// v13/v13.1 教训：supportArchiveTypeArray 注入导致闪退（App 对类型表的内部依赖过深）→ 已移除。
-// v14 方案：用户把 xxx.7z.lz4 改名为 xxx.7z（App 原生认识 → 出现解压选项）→
-// 点击时 hook 检查文件头：LZ4 magic → 先解 lz4 层 → 接力解内层 7z。
-// 真实 7z 文件头 37 7A BC AF 27 1C 与 lz4 (04 22 4D 18) 完全不同，零误伤。
+// libipaenhancer v15 — lz4 解压 + 启动崩溃修复 + 魔数嗅探 + RAR5 volume 标志修补
+// 新增：实测部分发布包把单卷 RAR5 误设 volume 标志（main flags=0x05），unrar 找不到下一卷
+// 导致解出文件缺失（解压喵等不校验）。解出内层 .rar 后自动清除该位并重算 header CRC32。
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -86,15 +84,12 @@ static BOOL hasLz4Magic(NSString *path) {
 }
 
 static DecoderFn decoderFor(NSString *path, NSString **innerOut) {
-    // 1) 明确 lz4 后缀
     NSString *inner = innerName(path);
     if (inner) { *innerOut = inner; return decode_lz4; }
-    // 2) 魔数嗅探：App 认识的后缀（用户把 xxx.7z.lz4 改名为 xxx.7z 后命中）
-    //    真实 7z 头是 37 7A BC AF 27 1C，与 lz4 完全不同，零误伤
     NSString *low = path.lastPathComponent.lowercaseString;
     if ([low hasSuffix:@".7z"] || [low hasSuffix:@".zip"] || [low hasSuffix:@".tar"]) {
         if (hasLz4Magic(path)) {
-            *innerOut = path.lastPathComponent; // 同名解出，uniqueDst 自动避让成 xxx(1).7z
+            *innerOut = path.lastPathComponent;
             return decode_lz4;
         }
     }
@@ -254,6 +249,54 @@ static BOOL new_copy3(id self, SEL _cmd, NSString *src, NSString *dst, NSError *
     return enh_protected_copy(self, src, dst, 0, error, NO, "3");
 }
 
+// ---------------- RAR5 volume 标志修补 ----------------
+// 实测：部分发布包把单卷 RAR5 误设 volume 标志（main flags=0x05），
+// unrar 找不到下一卷 → 解出文件缺失。解压喵等工具不校验该标志。
+// 对策：解出内层 .rar 后，main flags=0x05 → 清 volume 位 + 重算 header CRC32。
+
+static uint32_t enh_crc32(const uint8_t *d, size_t n) {
+    static uint32_t table[256];
+    static int init = 0;
+    if (!init) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            table[i] = c;
+        }
+        init = 1;
+    }
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) c = table[(c ^ d[i]) & 0xff] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+static void fixRarVolumeFlag(NSString *path) {
+    if (![path.lowercaseString hasSuffix:@".rar"]) return;
+    FILE *f = fopen(path.fileSystemRepresentation, "rb+");
+    if (!f) return;
+    uint8_t h[16];
+    if (fread(h, 1, 16, f) != 16) { fclose(f); return; }
+    if (memcmp(h, "Rar!\x1a\x07\x01\x00", 8) != 0) { fclose(f); return; } // 仅 RAR5
+    if (h[13] != 0x01) { fclose(f); return; }   // main archive header
+    if (h[14] != 0x05) { fclose(f); return; }   // flags = volume|solid 才修
+    uint8_t hsz = h[12];                        // HeaderSize vint（main header 极小，恒 1 字节）
+    if (hsz < 2 || hsz > 127) { fclose(f); return; }
+    uint8_t *buf = (uint8_t *)malloc(hsz);
+    fseek(f, 12, SEEK_SET);
+    if (fread(buf, 1, hsz, f) != hsz) { free(buf); fclose(f); return; }
+    buf[2] = 0x04;                              // flags: 清 volume 位（保留 solid）
+    uint32_t crc = enh_crc32(buf, hsz);
+    free(buf);
+    fseek(f, 14, SEEK_SET);
+    uint8_t nb = 0x04;
+    fwrite(&nb, 1, 1, f);
+    fseek(f, 8, SEEK_SET);
+    fwrite(&crc, 4, 1, f);                      // little-endian
+    fflush(f);
+    fclose(f);
+    enh_log(@"rar: volume 标志误设已清除 %@", path.lastPathComponent);
+}
+
 // ---------------- 解压入口 hook（lz4 双层接力） ----------------
 
 static void (*orig_unarchiveFile)(id self, SEL _cmd, NSString *src, NSString *desDir,
@@ -269,6 +312,7 @@ static void new_unarchiveFile(id self, SEL _cmd, NSString *src, NSString *desDir
             BOOL ok = dst && fn(src, dst, &err);
             enh_log(@"lz4: %@ src=%@", ok ? @"OK" : @"FAIL", src.lastPathComponent);
             if (ok) {
+                if ([dst.lowercaseString hasSuffix:@".rar"]) fixRarVolumeFlag(dst);
                 new_unarchiveFile(self, _cmd, dst, desDir, progressBlock, completeBlock);
                 return;
             }
@@ -290,6 +334,7 @@ static void new_handleUnzip(id self, SEL _cmd, NSString *path) {
                 NSString *dst = uniqueDst(dir, inner);
                 NSError *err = nil;
                 if (dst && fn(path, dst, &err)) {
+                    if ([dst.lowercaseString hasSuffix:@".rar"]) fixRarVolumeFlag(dst);
                     dispatch_async(dispatch_get_main_queue(), ^{ orig_handleUnzip(self, _cmd, dst); });
                 } else {
                     dispatch_async(dispatch_get_main_queue(), ^{ orig_handleUnzip(self, _cmd, path); });
@@ -328,6 +373,6 @@ static void enhancer_init(void) {
                 (IMP)new_copy4, (IMP *)&orig_copy4_base);
         swizzle([NSFileManager class], @selector(copyItemAtPath:toPath:error:),
                 (IMP)new_copy3, (IMP *)&orig_copy3_base);
-        enh_log(@"enhancer v14 loaded (lz4 + magic sniff + copy protection)");
+        enh_log(@"enhancer v15 loaded (lz4 + magic sniff + copy protection + rar5 volume fix)");
     }
 }
