@@ -10,21 +10,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch lz4 + brotli sources
-        run: |
-          git clone --depth 1 https://github.com/lz4/lz4.git
-          git clone --depth 1 https://github.com/google/brotli.git
+      - name: Fetch lz4 source
+        run: git clone --depth 1 https://github.com/lz4/lz4.git
 
       - name: Unit test (macOS host, real Foundation/ObjC runtime)
         run: |
           {
             set -x
-            BROTLI_ALL=$(ls brotli/c/common/*.c brotli/c/dec/*.c brotli/c/enc/*.c)
-            clang -g -O1 -DENH_DEBUG -Ilz4/lib -Ibrotli/c/include \
+            clang -g -O1 -Ilz4/lib \
               test_main.m \
               lz4/lib/lz4.c lz4/lib/lz4frame.c lz4/lib/lz4hc.c lz4/lib/xxhash.c \
-              $BROTLI_ALL \
-              -framework Foundation -lz -lbz2 \
+              -framework Foundation \
               -o tester
             ./tester || true
           } > test.log 2>&1
@@ -42,15 +38,12 @@ jobs:
             set -x
             SDK=$(xcrun -sdk iphoneos --show-sdk-path)
             echo "SDK: $SDK"
-            BROTLI_SRC=$(ls brotli/c/common/*.c brotli/c/dec/*.c)
             xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=11.0 \
               -dynamiclib -O2 \
-              -Ilz4/lib -Ibrotli/c/include \
+              -Ilz4/lib \
               enhancer.m \
               lz4/lib/lz4.c lz4/lib/lz4frame.c lz4/lib/lz4hc.c lz4/lib/xxhash.c \
-              $BROTLI_SRC \
-              -framework Foundation -framework UIKit \
-              -lz -lbz2 \
+              -framework Foundation \
               -install_name @executable_path/Frameworks/libipaenhancer.dylib \
               -Wl,-headerpad_max_install_names \
               -o libipaenhancer.dylib
