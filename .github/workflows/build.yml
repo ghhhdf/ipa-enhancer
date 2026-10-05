@@ -43,7 +43,7 @@ jobs:
               -Ilz4/lib \
               enhancer.m \
               lz4/lib/lz4.c lz4/lib/lz4frame.c lz4/lib/lz4hc.c lz4/lib/xxhash.c \
-              -framework Foundation \
+              -framework Foundation -framework UIKit \
               -install_name @executable_path/Frameworks/libipaenhancer.dylib \
               -Wl,-headerpad_max_install_names \
               -o libipaenhancer.dylib
