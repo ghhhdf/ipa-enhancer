@@ -1,8 +1,8 @@
-// libipaenhancer v13.1 — lz4 解压 + 启动崩溃修复 + UI 类型表注入（安全闸门版）
-// v13 闪退原因：App 类型表元素可能是自定义对象（非 NSString），直接追加 NSString
-// 会让调用方调用不存在的选择器 → 崩溃。
-// v13.1：注入前先检查元素类型——是 NSString 才追加（安全）；否则记录原表内容后
-// 原样返回（不崩），日志中的元素类信息用于下一轮精准适配。
+// libipaenhancer v14 — lz4 解压 + 启动崩溃修复 + 魔数嗅探（零 UI 侵入）
+// v13/v13.1 教训：supportArchiveTypeArray 注入导致闪退（App 对类型表的内部依赖过深）→ 已移除。
+// v14 方案：用户把 xxx.7z.lz4 改名为 xxx.7z（App 原生认识 → 出现解压选项）→
+// 点击时 hook 检查文件头：LZ4 magic → 先解 lz4 层 → 接力解内层 7z。
+// 真实 7z 文件头 37 7A BC AF 27 1C 与 lz4 (04 22 4D 18) 完全不同，零误伤。
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -71,9 +71,35 @@ static NSString *innerName(NSString *path) {
     return nil;
 }
 
+// lz4 魔数嗅探：文件后缀被用户改名（去掉 .lz4）但内容仍是 lz4 流
+static BOOL hasLz4Magic(NSString *path) {
+    FILE *f = fopen(path.fileSystemRepresentation, "rb");
+    if (!f) return NO;
+    uint8_t m[4];
+    size_t n = fread(m, 1, 4, f);
+    fclose(f);
+    if (n < 4) return NO;
+    uint32_t v = (uint32_t)m[0] | ((uint32_t)m[1] << 8) | ((uint32_t)m[2] << 16) | ((uint32_t)m[3] << 24);
+    if (v == 0x184D2204) return YES;                 // lz4 frame magic
+    if ((v & 0xFFFFFFF0u) == 0x184D2A50) return YES; // legacy/skippable frame
+    return NO;
+}
+
 static DecoderFn decoderFor(NSString *path, NSString **innerOut) {
-    *innerOut = innerName(path);
-    return *innerOut ? decode_lz4 : NULL;
+    // 1) 明确 lz4 后缀
+    NSString *inner = innerName(path);
+    if (inner) { *innerOut = inner; return decode_lz4; }
+    // 2) 魔数嗅探：App 认识的后缀（用户把 xxx.7z.lz4 改名为 xxx.7z 后命中）
+    //    真实 7z 头是 37 7A BC AF 27 1C，与 lz4 完全不同，零误伤
+    NSString *low = path.lastPathComponent.lowercaseString;
+    if ([low hasSuffix:@".7z"] || [low hasSuffix:@".zip"] || [low hasSuffix:@".tar"]) {
+        if (hasLz4Magic(path)) {
+            *innerOut = path.lastPathComponent; // 同名解出，uniqueDst 自动避让成 xxx(1).7z
+            return decode_lz4;
+        }
+    }
+    *innerOut = nil;
+    return NULL;
 }
 
 static NSString *uniqueDst(NSString *dir, NSString *name) {
@@ -275,49 +301,6 @@ static void new_handleUnzip(id self, SEL _cmd, NSString *path) {
     orig_handleUnzip(self, _cmd, path);
 }
 
-// ---------------- UI 类型表：让 App 把 lz4 家族当压缩包（安全闸门版） ----------------
-
-static NSArray *(*orig_supportTypes)(id, SEL);
-static NSArray *new_supportTypes(id self, SEL _cmd) {
-    NSArray *r = orig_supportTypes(self, _cmd);
-    static NSArray *extra = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        extra = @[@"lz4", @".lz4", @"7z.lz4", @".7z.lz4", @"zip.lz4", @".zip.lz4",
-                  @"tar.lz4", @".tar.lz4"];
-        enh_log(@"supportArchiveTypeArray 原内容: %@ (元素类: %@)", r, r.count ? NSStringFromClass([r[0] class]) : @"空");
-    });
-    // 安全闸门：仅当元素是 NSString 时才追加（自定义对象类型表会因不识别 NSString 崩溃）
-    if ([r isKindOfClass:[NSArray class]] && r.count > 0 &&
-        [r[0] isKindOfClass:[NSString class]]) {
-        return [r arrayByAddingObjectsFromArray:extra];
-    }
-    return r;
-}
-
-static void hook_support_types(void) {
-    SEL sel = NSSelectorFromString(@"supportArchiveTypeArray");
-    unsigned int n = 0;
-    Class *list = objc_copyClassList(&n);
-    if (!list) return;
-    int hooked = 0;
-    for (unsigned int i = 0; i < n; i++) {
-        Class c = list[i];
-        if (!class_getInstanceMethod(c, sel)) continue;
-        const char *nm = class_getName(c);
-        if (strncmp(nm, "UI", 2) == 0 || strncmp(nm, "_", 1) == 0) continue;
-        Method m = class_getInstanceMethod(c, sel);
-        if (!m) continue;
-        if (class_getInstanceMethod(class_getSuperclass(c), sel) == m) continue;
-        orig_supportTypes = (NSArray *(*)(id, SEL))method_getImplementation(m);
-        method_setImplementation(m, (IMP)new_supportTypes);
-        enh_log(@"hook supportArchiveTypeArray: %s", nm);
-        hooked++;
-    }
-    free(list);
-    if (!hooked) enh_log(@"未找到 supportArchiveTypeArray 实现类");
-}
-
 static void swizzle(Class cls, SEL sel, IMP newImp, IMP *origOut) {
     if (!cls) return;
     Method m = class_getInstanceMethod(cls, sel);
@@ -345,7 +328,6 @@ static void enhancer_init(void) {
                 (IMP)new_copy4, (IMP *)&orig_copy4_base);
         swizzle([NSFileManager class], @selector(copyItemAtPath:toPath:error:),
                 (IMP)new_copy3, (IMP *)&orig_copy3_base);
-        hook_support_types();
-        enh_log(@"enhancer v13.1 loaded (lz4 + copy protection + UI type injection w/ guard)");
+        enh_log(@"enhancer v14 loaded (lz4 + magic sniff + copy protection)");
     }
 }
